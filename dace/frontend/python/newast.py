@@ -4272,9 +4272,9 @@ class ProgramVisitor(ExtNodeVisitor):
         # If visiting an attribute, return attribute value if it's of an array or global
         name = until(astutils.unparse(node), '.')
         result = self._visitname(name, node)
-        if result in self.sdfg.arrays:
+        if isinstance(result, str) and result in self.sdfg.arrays:
             arr = self.sdfg.arrays[result]
-        elif result in self.scope_arrays:
+        elif isinstance(result, str) and result in self.scope_arrays:
             arr = self.scope_arrays[result]
         else:
             return result
