@@ -99,7 +99,7 @@ class StartStateElimination(transformation.MultiStateTransformation):
         for assign in edge.data.assignments.values():
             if graph.arrays.keys() & symbolic.free_symbols_and_functions(assign):
                 return False
-        
+
         return True
 
     def apply(self, _, sdfg):
@@ -586,7 +586,6 @@ class DeadStateElimination(transformation.MultiStateTransformation):
         state: SDFGState = self.end_state
         in_edges = graph.in_edges(state)
 
-        # We only match end states with one source and at least one assignment
         if len(in_edges) != 1:
             return False
         edge = in_edges[0]
@@ -613,7 +612,9 @@ class DeadStateElimination(transformation.MultiStateTransformation):
         sdfg.remove_nodes_from(states_to_remove)
 
 
-class TrueConditionElimination(transformation.MultiStateTransformation, transformation.SimplifyPass):
+class TrueConditionElimination(
+    transformation.MultiStateTransformation, transformation.SimplifyPass
+):
     """
     If a state transition condition is always true, removes condition from edge.
     """
@@ -646,3 +647,47 @@ class TrueConditionElimination(transformation.MultiStateTransformation, transfor
         b: SDFGState = self.state_b
         edge = sdfg.edges_between(a, b)[0]
         edge.data.condition = CodeBlock("1")
+
+
+class FalseConditionElimination(transformation.MultiStateTransformation):
+    """
+    If a state transition condition is always true, removes condition from edge.
+    """
+
+    state_a = transformation.PatternNode(sdfg.SDFGState)
+    state_b = transformation.PatternNode(sdfg.SDFGState)
+
+    @classmethod
+    def expressions(cls):
+        return [sdutil.node_path_graph(cls.state_a, cls.state_b)]
+
+    def can_be_applied(self, graph: SDFG, expr_index, sdfg: SDFG, permissive=False):
+        a: SDFGState = self.state_a
+        b: SDFGState = self.state_b
+
+        in_edges = graph.in_edges(b)
+
+        # Only apply in cases where DeadStateElimination wouldn't
+        if len(in_edges) <= 1:
+            return False
+
+        # Directed graph has only one edge between two nodes
+        edge = graph.edges_between(a, b)[0]
+
+        if edge.data.assignments:
+            return False
+        if edge.data.is_unconditional():
+            return False
+
+        # Evaluate condition
+        scond = edge.data.condition_sympy()
+        if scond == False:
+            return True
+
+        return False
+
+    def apply(self, _, sdfg: SDFG):
+        a: SDFGState = self.state_a
+        b: SDFGState = self.state_b
+        edge = sdfg.edges_between(a, b)[0]
+        sdfg.remove_edge(edge)

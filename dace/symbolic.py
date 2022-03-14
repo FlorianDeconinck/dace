@@ -779,8 +779,8 @@ def pystr_to_symbolic(expr, symbol_map=None, simplify=None):
         'floor': sympy.floor,
         'ceil': sympy.ceiling,
         # Convert and/or to special sympy functions to avoid boolean evaluation
-        'And': sympy.Function('AND'),
-        'Or': sympy.Function('OR'),
+        'And': AND,
+        'Or': OR,
         'var': sympy.Symbol('var'),
         'root': sympy.Symbol('root'),
         'arg': sympy.Symbol('arg'),
@@ -802,6 +802,25 @@ def pystr_to_symbolic(expr, symbol_map=None, simplify=None):
         expr = expr.replace('[', '(')
         expr = expr.replace(']', ')')
         return sympy_to_dace(sympy.sympify(expr, locals, evaluate=simplify), symbol_map)
+
+class OR(sympy.Function):
+    @classmethod
+    def eval(cls, x, y):
+        if x.is_Boolean and y.is_Boolean:
+            return x or y
+
+    def _eval_is_boolean(self):
+        return True
+
+
+class AND(sympy.Function):
+    @classmethod
+    def eval(cls, x, y):
+        if x.is_Boolean and y.is_Boolean:
+            return x and y
+
+    def _eval_is_boolean(self):
+        return True
 
 
 @lru_cache(maxsize=2048)
