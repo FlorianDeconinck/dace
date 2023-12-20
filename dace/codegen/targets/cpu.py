@@ -1233,8 +1233,10 @@ class CPUCodeGen(TargetCodeGenerator):
                     if is_pointer:
                         # This is done to make the reference constant, otherwise
                         # compilers error out with initial reference value.
-                        memlet_type += ' const'
-                    result += "{} &{} = {};".format(memlet_type, local_name, expr)
+                        # memlet_type += ' const'
+                        result += "{} {} = {};".format(memlet_type, local_name, expr)
+                    else:
+                        result += "{} &{} = {};".format(memlet_type, local_name, expr)
                 defined = (DefinedType.Scalar if is_scalar else DefinedType.Pointer)
         elif var_type in [DefinedType.Stream, DefinedType.StreamArray]:
             if not memlet.dynamic and memlet.num_accesses == 1:
@@ -1309,6 +1311,9 @@ class CPUCodeGen(TargetCodeGenerator):
 
         self._dispatcher.defined_vars.enter_scope(node)
 
+        # if node.label == "lagrangian_contributions_computation_139709614342352_Tasklet":
+        #     breakpoint()
+
         arrays = set()
         for edge in state_dfg.in_edges(node):
             u = edge.src
@@ -1328,6 +1333,8 @@ class CPUCodeGen(TargetCodeGenerator):
                                                                       dfg.node_id(node), edge.src_conn)
 
                     # Read variable from shared storage
+                    # if node.label == "lagrangian_contributions_computation_139709614342352_Tasklet":
+                    #     breakpoint()
                     defined_type, _ = self._dispatcher.defined_vars.get(shared_data_name)
                     if defined_type in (DefinedType.Scalar, DefinedType.Pointer):
                         assign_str = (f"const {ctype} {edge.dst_conn} = {shared_data_name};")
@@ -1337,6 +1344,8 @@ class CPUCodeGen(TargetCodeGenerator):
                     self._dispatcher.defined_vars.add(edge.dst_conn, defined_type, f"const {ctype}")
 
                 else:
+                    # if node.label == "lagrangian_contributions_computation_139709614342352_Tasklet":
+                    #     breakpoint()
                     self._dispatcher.dispatch_copy(
                         src_node,
                         node,
@@ -1351,6 +1360,9 @@ class CPUCodeGen(TargetCodeGenerator):
                 # Also define variables in the C++ unparser scope
                 self._locals.define(edge.dst_conn, -1, self._ldepth + 1, ctype)
                 arrays.add(edge.dst_conn)
+
+        # if node.label == "lagrangian_contributions_computation_139709614342352_Tasklet":
+        #     breakpoint()
 
         # Use outgoing edges to preallocate output local vars
         # in two stages: first we preallocate for data<->code cases,
@@ -1372,6 +1384,9 @@ class CPUCodeGen(TargetCodeGenerator):
                 # Also define variables in the C++ unparser scope
                 self._locals.define(edge.src_conn, -1, self._ldepth + 1, node.out_connectors[edge.src_conn].ctype)
                 tasklet_out_connectors.add(edge.src_conn)
+
+        # if node.label == "lagrangian_contributions_computation_139709614342352_Tasklet":
+        #     breakpoint()
 
         for edge in state_dfg.out_edges(node):
             # Special case: code->code
@@ -1420,6 +1435,9 @@ class CPUCodeGen(TargetCodeGenerator):
         # Emit post-memlet tasklet preamble code
         callsite_stream.write(after_memlets_stream.getvalue())
 
+        # if node.label == "lagrangian_contributions_computation_139709614342352_Tasklet":
+        #     breakpoint()
+            
         # Instrumentation: Pre-tasklet
         instr = self._dispatcher.instrumentation[node.instrument]
         if instr is not None:
