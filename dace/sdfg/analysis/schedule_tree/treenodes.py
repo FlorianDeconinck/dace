@@ -11,7 +11,7 @@ from dace.sdfg.sdfg import InterstateEdge, SDFG, memlets_in_ast
 from dace.sdfg.state import LoopRegion, SDFGState
 from dace.memlet import Memlet
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Literal, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Literal, Optional, Set, Tuple, Union, Sequence
 
 if TYPE_CHECKING:
     from dace import SDFG
@@ -372,40 +372,6 @@ class ScheduleTreeRoot(ScheduleTreeScope):
 
     def scope(self, state: SDFGState, ctx: Context) -> ContextPushPop:
         return ContextPushPop(ctx, state, self)
-
-
-@dataclass
-class ScheduleTreeRoot(ScheduleTreeScope):
-    """
-    A root of an SDFG schedule tree. This is a schedule tree scope with additional information on
-    the available descriptors, symbol types, and constants of the tree, aka the descriptor repository.
-    """
-    name: str
-    containers: Dict[str, data.Data]
-    symbols: Dict[str, dtypes.typeclass]
-    constants: Dict[str, Tuple[data.Data, Any]]
-    callback_mapping: Dict[str, str]
-    arg_names: List[str]
-
-    def __init__(
-        self,
-        *,
-        name: str,
-        children: List[ScheduleTreeNode],
-        containers: Optional[Dict[str, data.Data]] = None,
-        symbols: Optional[Dict[str, dtypes.typeclass]] = None,
-        constants: Optional[Dict[str, Tuple[data.Data, Any]]] = None,
-        callback_mapping: Optional[Dict[str, str]] = None,
-        arg_names: Optional[List[str]] = None,
-    ) -> None:
-        super().__init__(children=children)
-
-        self.name = name
-        self.containers = containers if containers is not None else dict()
-        self.symbols = symbols if symbols is not None else dict()
-        self.constants = constants if constants is not None else dict()
-        self.callback_mapping = callback_mapping if callback_mapping is not None else dict()
-        self.arg_names = arg_names if arg_names is not None else list()
 
 
 @dataclass
