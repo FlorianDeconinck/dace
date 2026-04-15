@@ -276,11 +276,11 @@ class _ContainerRenamer(tn.ScheduleNodeTransformer):
     # -- scope containers -----------------------------------------------
 
     def visit_scope(self, node: tn.ScheduleTreeScope):
-        if node.containers:
+        if node.get_root().containers:
             new_containers: Dict[str, data.Data] = {}
-            for k, v in node.containers.items():
+            for k, v in node.get_root().containers.items():
                 new_containers[self._rename(k)] = v
-            node.containers = new_containers
+            node.get_root().containers = new_containers
         self.generic_visit(node)
         return node
 
