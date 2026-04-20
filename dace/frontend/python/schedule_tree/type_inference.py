@@ -6,14 +6,16 @@ import collections.abc as cabc
 import copy
 import inspect
 import numbers
+import numpy as np
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable as TypingIterable, Iterator as TypingIterator, List, Optional, Sequence, Tuple, \
     get_args, get_origin
 
-from dace import data, dtypes, symbolic
+from dace import data, dtypes, symbolic, subsets
 from dace.data.pydata import PythonList, PythonTuple
 from dace.frontend.python import astutils, memlet_parser
 from dace.frontend.python.schedule_tree.match_support import UnsupportedMatchPatternError, lower_match_to_statements
+from dace.frontend.python.schedule_tree.structure_helpers import bind_target_structure, descriptor_from_structure
 from dace.frontend.python.schedule_tree.static_evaluation import UNRESOLVED, try_resolve_static_value
 from dace.sdfg.type_inference import infer_expr_type
 
@@ -57,6 +59,242 @@ def _pyobject_scalar_descriptor() -> data.Scalar:
     return data.Scalar(dtypes.pyobject(), transient=True)
 
 
+def _string_scalar_descriptor() -> data.Scalar:
+    return data.Scalar(dtypes.string, transient=True)
+
+
+def _is_scalar_subscript(node: ast.Subscript, subset: subsets.Range, new_axes: Sequence[int],
+                         arrdims: Dict[int, str]) -> bool:
+    if new_axes or arrdims:
+        return False
+    if isinstance(node.slice, ast.Slice):
+        return False
+    if isinstance(node.slice, ast.Tuple):
+        for element in node.slice.elts:
+            if isinstance(element, ast.Slice):
+                return False
+            if isinstance(element, ast.Constant) and element.value in {None, Ellipsis}:
+                return False
+    for (start, end, step), tile in zip(subset.ranges, subset.tile_sizes):
+        if tile != 1 or step != 1 or start != end:
+            return False
+    return True
+
+
+def _infer_static_subscript_descriptor(descriptor: data.Data, node: ast.Subscript,
+                                       evaluation_context: Dict[str, Any]) -> Optional[data.Data]:
+    if not hasattr(descriptor, 'shape') or not hasattr(descriptor, 'dtype'):
+        return None
+
+    index_value = try_resolve_static_value(node.slice, evaluation_context)
+    if index_value is UNRESOLVED:
+        return None
+
+    result_shape = _infer_static_subscript_shape(tuple(descriptor.shape), index_value)
+    if result_shape is None:
+        return None
+    if not result_shape:
+        return data.Scalar(descriptor.dtype, transient=True)
+    return data.Array(descriptor.dtype, list(result_shape), transient=True)
+
+
+def _infer_static_subscript_shape(array_shape: Tuple[Any, ...], index_value: Any) -> Optional[Tuple[Any, ...]]:
+    expanded = _expand_static_indices(index_value, len(array_shape))
+    if expanded is None:
+        return None
+
+    chunks: List[Any] = []
+    advanced_shapes: List[Tuple[int, ...]] = []
+    advanced_groups = 0
+    in_advanced_group = False
+    array_dim = 0
+
+    for index in expanded:
+        if index is None:
+            chunks.append((1, ))
+            in_advanced_group = False
+            continue
+
+        if array_dim >= len(array_shape):
+            return None
+
+        if _is_static_integer_index(index):
+            array_dim += 1
+            in_advanced_group = False
+            continue
+
+        advanced_shape = _static_advanced_index_shape(index)
+        if advanced_shape is not None:
+            advanced_shapes.append(advanced_shape)
+            if not in_advanced_group:
+                chunks.append('ADV')
+                advanced_groups += 1
+                in_advanced_group = True
+            array_dim += 1
+            continue
+
+        if not isinstance(index, slice):
+            return None
+
+        slice_dim = _static_slice_result_dim(array_shape[array_dim], index)
+        if slice_dim is None:
+            return None
+        chunks.append((slice_dim, ))
+        array_dim += 1
+        in_advanced_group = False
+
+    while array_dim < len(array_shape):
+        chunks.append((array_shape[array_dim], ))
+        array_dim += 1
+
+    if not advanced_shapes:
+        return tuple(dim for chunk in chunks for dim in chunk)
+
+    broadcast_shape = _broadcast_static_shapes(advanced_shapes)
+    if broadcast_shape is None:
+        return None
+
+    if advanced_groups == 1:
+        output_shape: List[Any] = []
+        inserted = False
+        for chunk in chunks:
+            if chunk == 'ADV':
+                if not inserted:
+                    output_shape.extend(broadcast_shape)
+                    inserted = True
+                continue
+            output_shape.extend(chunk)
+        return tuple(output_shape)
+
+    output_shape = list(broadcast_shape)
+    for chunk in chunks:
+        if chunk == 'ADV':
+            continue
+        output_shape.extend(chunk)
+    return tuple(output_shape)
+
+
+def _expand_static_indices(index_value: Any, rank: int) -> Optional[List[Any]]:
+    indices = list(index_value) if isinstance(index_value, tuple) else [index_value]
+    if sum(1 for index in indices if index is Ellipsis) > 1:
+        return None
+
+    consumed = sum(1 for index in indices if index is not None and index is not Ellipsis)
+    expanded: List[Any] = []
+    ellipsis_seen = False
+    for index in indices:
+        if index is Ellipsis:
+            ellipsis_seen = True
+            expanded.extend([slice(None)] * max(rank - consumed, 0))
+            continue
+        expanded.append(index)
+
+    if not ellipsis_seen:
+        expanded.extend([slice(None)] * max(rank - consumed, 0))
+
+    return expanded
+
+
+def _is_static_integer_index(index: Any) -> bool:
+    return isinstance(index, numbers.Integral) and not isinstance(index, bool)
+
+
+def _static_advanced_index_shape(index: Any) -> Optional[Tuple[int, ...]]:
+    if isinstance(index, np.ndarray):
+        if index.ndim == 0 or index.dtype == bool:
+            return None
+        return tuple(index.shape)
+
+    if isinstance(index, list):
+        return _static_nested_sequence_shape(index)
+
+    if isinstance(index, tuple):
+        nested_shape = _static_nested_sequence_shape(list(index))
+        if nested_shape is None:
+            return None
+        return nested_shape
+
+    return None
+
+
+def _static_nested_sequence_shape(value: List[Any]) -> Optional[Tuple[int, ...]]:
+    if not value:
+        return (0, )
+    first = value[0]
+    if isinstance(first, (list, tuple)):
+        inner_shape = _static_nested_sequence_shape(list(first))
+        if inner_shape is None:
+            return None
+        for element in value[1:]:
+            if not isinstance(element, (list, tuple)):
+                return None
+            if _static_nested_sequence_shape(list(element)) != inner_shape:
+                return None
+        return (len(value), ) + inner_shape
+
+    if any(isinstance(element, (list, tuple)) for element in value[1:]):
+        return None
+    if any(not _is_static_integer_index(element) for element in value):
+        return None
+    return (len(value), )
+
+
+def _static_slice_result_dim(dim_size: Any, index: slice) -> Optional[Any]:
+    if index == slice(None):
+        return dim_size
+
+    step = 1 if index.step is None else index.step
+    try:
+        if step == 0:
+            return None
+    except TypeError:
+        pass
+
+    step_is_negative = (step < 0) == True
+    step_is_positive = (step > 0) == True
+    if not step_is_negative and not step_is_positive:
+        return None
+
+    if index.start is None:
+        start = dim_size - 1 if step_is_negative else 0
+    else:
+        start = index.start
+
+    if index.stop is None:
+        stop = -1 if step_is_negative else dim_size
+    else:
+        stop = index.stop
+
+    try:
+        if (start < 0) == True:
+            start += dim_size
+    except TypeError:
+        pass
+    try:
+        if (stop < 0) == True:
+            stop += dim_size
+    except TypeError:
+        pass
+
+    end = stop + 1 if step_is_negative else stop - 1
+    return subsets.Range([(start, end, step)]).size()[0]
+
+
+def _broadcast_static_shapes(shapes: Sequence[Tuple[int, ...]]) -> Optional[Tuple[int, ...]]:
+    result: List[int] = []
+    max_rank = max(len(shape) for shape in shapes)
+    for axis in range(max_rank):
+        axis_sizes = []
+        for shape in shapes:
+            offset = axis - (max_rank - len(shape))
+            axis_sizes.append(1 if offset < 0 else shape[offset])
+        size = max(axis_sizes)
+        if any(axis_size not in {1, size} for axis_size in axis_sizes):
+            return None
+        result.append(size)
+    return tuple(result)
+
+
 def _should_fallback_to_pyobject_scalar(node: ast.AST, value: Any = UNRESOLVED) -> bool:
     if value is None or isinstance(value, (str, bytes, numbers.Number, bool, type(Ellipsis))):
         return False
@@ -75,7 +313,11 @@ class ScheduleTreeTypeInference(ast.NodeVisitor):
         }
         self.results: Dict[str, _Binding] = {}
 
-    def infer(self, program: ast.FunctionDef) -> Dict[str, _Binding]:
+    def infer(self, program: ast.AST) -> Dict[str, _Binding]:
+        if isinstance(program, ast.Module):
+            program = program.body[0] if program.body else None
+        if not isinstance(program, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return {}
         for stmt in program.body:
             self.visit(stmt)
         return {name: _clone_binding(binding) for name, binding in self.results.items()}
@@ -125,6 +367,14 @@ class ScheduleTreeTypeInference(ast.NodeVisitor):
             self.visit(stmt)
         for stmt in node.orelse:
             self.visit(stmt)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        # Nested function-local bindings must not leak into the enclosing
+        # schedule-tree type-inference scope.
+        return
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        return
 
     def _visit_branch(self, body: Sequence[ast.AST], initial: Dict[str, _Binding]) -> Dict[str, _Binding]:
         previous = self.bindings
@@ -216,7 +466,7 @@ class ScheduleTreeTypeInference(ast.NodeVisitor):
             if binding is None or binding.descriptor is None:
                 return None
             structure = self._subscript_structure(binding, value.slice)
-            descriptor = self._descriptor_from_structure(structure) if structure is not None else None
+            descriptor = descriptor_from_structure(structure) if structure is not None else None
             if descriptor is None:
                 descriptor = self._subscript_descriptor(binding.descriptor, value)
             if descriptor is None:
@@ -235,7 +485,7 @@ class ScheduleTreeTypeInference(ast.NodeVisitor):
             structure = self._structure_from_expression(value)
             if structure is None:
                 return None
-            descriptor = self._descriptor_from_structure(structure)
+            descriptor = descriptor_from_structure(structure)
             if descriptor is None:
                 return None
             kind = 'scalar' if isinstance(descriptor, data.Scalar) else 'container'
@@ -251,15 +501,13 @@ class ScheduleTreeTypeInference(ast.NodeVisitor):
             structure = self._infer_iterable_structure(value.args[0])
             if structure is None:
                 return None
-            return _Binding(descriptor=self._descriptor_from_structure(structure), kind='iterator', structure=structure)
+            return _Binding(descriptor=descriptor_from_structure(structure), kind='iterator', structure=structure)
         if helper_name == '__dace_iterator_next' and value.args and isinstance(value.args[0], ast.Name):
             iterator_binding = self.bindings.get(value.args[0].id)
             if iterator_binding is None or iterator_binding.structure is None:
                 return None
-            structure = copy.deepcopy(iterator_binding.structure)
-            return _Binding(descriptor=self._descriptor_from_structure(structure),
-                            kind='iterator-value',
-                            structure=structure)
+            structure = (data.Scalar(dtypes.bool, transient=True), copy.deepcopy(iterator_binding.structure))
+            return _Binding(descriptor=descriptor_from_structure(structure), kind='iterator-value', structure=structure)
         return None
 
     def _infer_iterable_structure(self, node: ast.AST, env: Optional[Dict[str, Any]] = None) -> Optional[Any]:
@@ -516,10 +764,20 @@ class ScheduleTreeTypeInference(ast.NodeVisitor):
                 return None
             return data.Scalar(descriptor.dtype, transient=True)
 
+        static_descriptor = _infer_static_subscript_descriptor(descriptor, node, self._evaluation_context())
+
         try:
-            subset, new_axes, _ = memlet_parser.parse_memlet_subset(descriptor, node, self._evaluation_context())
+            subset, new_axes, arrdims = memlet_parser.parse_memlet_subset(descriptor, node, self._evaluation_context())
         except Exception:
-            return None
+            return static_descriptor
+        if _is_scalar_subscript(node, subset, new_axes, arrdims):
+            return data.Scalar(descriptor.dtype, transient=True)
+
+        if static_descriptor is not None:
+            if isinstance(static_descriptor, data.Scalar):
+                return static_descriptor
+            return self._make_view_descriptor(descriptor, static_descriptor.shape)
+
         return self._make_view_descriptor(descriptor, subset.size(), new_axes)
 
     def _infer_descriptor(self, node: ast.AST) -> Optional[data.Data]:
@@ -547,6 +805,9 @@ class ScheduleTreeTypeInference(ast.NodeVisitor):
         if annotated_descriptor is not None and isinstance(annotated_descriptor, data.Scalar):
             return _clone_descriptor(annotated_descriptor)
 
+        if isinstance(node, (ast.JoinedStr, ast.FormattedValue)):
+            return _string_scalar_descriptor()
+
         scalar_types = {
             name: binding.descriptor.dtype
             for name, binding in self.bindings.items()
@@ -560,6 +821,15 @@ class ScheduleTreeTypeInference(ast.NodeVisitor):
             return data.Scalar(inferred_type, transient=True)
 
         value = try_resolve_static_value(node, self._evaluation_context())
+        if value is not UNRESOLVED and value is not None:
+            try:
+                descriptor = _clone_descriptor(data.create_datadescriptor(value))
+            except Exception:
+                descriptor = None
+            if isinstance(descriptor, data.Scalar):
+                descriptor.transient = True
+                return descriptor
+
         if isinstance(value, numbers.Number) or isinstance(value, bool):
             dtype = _normalize_dtype(type(value))
             if dtype is not None:
@@ -666,57 +936,15 @@ class ScheduleTreeTypeInference(ast.NodeVisitor):
                 self._bind_loop_target(element)
 
     def _bind_target_structure(self, target: ast.AST, structure: Any) -> None:
-        if isinstance(target, ast.Name):
-            descriptor = self._descriptor_from_structure(structure)
+
+        def _bind(name: str, substructure: Any) -> None:
+            descriptor = descriptor_from_structure(substructure)
             if descriptor is None:
                 return
             kind = 'scalar' if isinstance(descriptor, data.Scalar) else 'container'
-            self._store_binding(target.id, descriptor, kind=kind, structure=structure)
-            return
-        if isinstance(target, ast.Starred):
-            if not isinstance(structure, list):
-                structure = list(structure) if isinstance(structure, tuple) else [structure]
-            self._bind_target_structure(target.value, structure)
-            return
-        if isinstance(target, (ast.Tuple, ast.List)) and isinstance(structure, (list, tuple)):
-            starred_indices = [index for index, element in enumerate(target.elts) if isinstance(element, ast.Starred)]
-            if len(starred_indices) > 1:
-                return
-            if not starred_indices:
-                if len(target.elts) != len(structure):
-                    return
-                for subtarget, substructure in zip(target.elts, structure):
-                    self._bind_target_structure(subtarget, substructure)
-                return
+            self._store_binding(name, descriptor, kind=kind, structure=substructure)
 
-            starred_index = starred_indices[0]
-            if len(structure) < len(target.elts) - 1:
-                return
-
-            prefix_targets = target.elts[:starred_index]
-            suffix_targets = target.elts[starred_index + 1:]
-            prefix_structures = structure[:starred_index]
-            suffix_structures = structure[len(structure) - len(suffix_targets):]
-            middle_structure = list(structure[starred_index:len(structure) - len(suffix_targets)])
-
-            for subtarget, substructure in zip(prefix_targets, prefix_structures):
-                self._bind_target_structure(subtarget, substructure)
-            self._bind_target_structure(target.elts[starred_index], middle_structure)
-            for subtarget, substructure in zip(suffix_targets, suffix_structures):
-                self._bind_target_structure(subtarget, substructure)
-
-    def _descriptor_from_structure(self, structure: Any) -> Optional[data.Data]:
-        if isinstance(structure, data.Data):
-            return _clone_descriptor(structure)
-        if not isinstance(structure, (list, tuple)):
-            return None
-        dtype = dtypes.pyobject()
-        if structure and all(isinstance(element, data.Scalar) for element in structure):
-            dtype = structure[0].dtype
-            for element in structure[1:]:
-                dtype = dtypes.result_type_of(dtype, element.dtype)
-        descriptor_type = PythonList if isinstance(structure, list) else PythonTuple
-        return descriptor_type(dtype=dtype, shape=(len(structure), ), transient=True)
+        bind_target_structure(target, structure, _bind)
 
     def _store_binding(self,
                        name: str,
@@ -755,6 +983,9 @@ class ScheduleTreeTypeInference(ast.NodeVisitor):
             descriptor = _clone_descriptor(value)
             descriptor.transient = True
             return descriptor
+        dtype = _normalize_dtype(value)
+        if dtype is not None:
+            return data.Scalar(dtype, transient=True)
         return None
 
     def _parse_shape(self, node: ast.AST) -> List[Any]:

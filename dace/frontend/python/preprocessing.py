@@ -19,7 +19,8 @@ from dace import data, dtypes, symbolic, sdfg
 from dace.config import Config
 from dace.sdfg import SDFG
 from dace.frontend.python import astutils
-from dace.frontend.python.common import (DaceSyntaxError, SDFGConvertible, SDFGClosure, StringLiteral)
+from dace.frontend.python.common import (DaceSyntaxError, SDFGConvertible, SDFGClosure, ScheduleTreeConvertible,
+                                         StringLiteral)
 
 if TYPE_CHECKING:
     from dace.frontend.python.parser import DaceProgram
@@ -52,15 +53,18 @@ class PreprocessedAST:
     program_globals: Dict[str, Any]
 
 
+TypeAlias = getattr(ast, 'TypeAlias', type(None))
+
+
 def __dace_iterator_init(iterable):
     return iterable.__iter__()
 
 
-def __dace_iterator_next(iterator, sentinel):
+def __dace_iterator_next(iterator):
     try:
-        return iterator.__next__()
+        return (True, iterator.__next__())
     except StopIteration:
-        return sentinel
+        return (False, None)
 
 
 class StructTransformer(ast.NodeTransformer):
@@ -122,6 +126,94 @@ class ModuleResolver(ast.NodeTransformer):
             cnode.value.id = self.modules[cnode.value.id]
 
         return self.generic_visit(node)
+
+
+class TypeAliasResolver(ast.NodeTransformer):
+    """Resolve compile-time-only ``type`` aliases inside function bodies."""
+
+    class _AnnotationRewriter(ast.NodeTransformer):
+
+        def __init__(self, aliases: Dict[str, ast.AST]) -> None:
+            self.aliases = aliases
+
+        def visit_Name(self, node: ast.Name) -> ast.AST:
+            if isinstance(node.ctx, ast.Load) and node.id in self.aliases:
+                return ast.copy_location(astutils.copy_tree(self.aliases[node.id]), node)
+            return node
+
+    def __init__(self, filename: str) -> None:
+        super().__init__()
+        self.filename = filename
+        self._alias_scopes: List[Dict[str, ast.AST]] = [dict()]
+        self._visitor = collections.namedtuple('Visitor', 'filename')
+        self._visitor.filename = filename
+
+    def _current_aliases(self) -> Dict[str, ast.AST]:
+        return self._alias_scopes[-1]
+
+    def _rewrite_annotation(self, node: Optional[ast.AST]) -> Optional[ast.AST]:
+        if node is None:
+            return None
+        rewritten = self._AnnotationRewriter(self._current_aliases()).visit(astutils.copy_tree(node))
+        return ast.fix_missing_locations(ast.copy_location(rewritten, node))
+
+    def _visit_body(self, body: List[ast.AST]) -> List[ast.AST]:
+        new_body: List[ast.AST] = []
+        for stmt in body:
+            if isinstance(stmt, TypeAlias):
+                self._bind_type_alias(stmt)
+                continue
+
+            visited = self.visit(stmt)
+            if visited is None:
+                continue
+            if isinstance(visited, list):
+                new_body.extend(value for value in visited if value is not None)
+            else:
+                new_body.append(visited)
+        return new_body
+
+    def _bind_type_alias(self, node: TypeAlias) -> None:
+        if getattr(node, 'type_params', None):
+            raise DaceSyntaxError(self._visitor, node,
+                                  'Generic type aliases are unsupported in @dace.program preprocessing')
+
+        if not isinstance(getattr(node, 'name', None), ast.Name):
+            return
+
+        self._current_aliases()[node.name.id] = self._rewrite_annotation(node.value)
+
+    def visit_Module(self, node: ast.Module) -> ast.Module:
+        node.body = self._visit_body(node.body)
+        return node
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
+        node.decorator_list = [self.visit(decorator) for decorator in node.decorator_list]
+        node.args = self.visit(node.args)
+        node.returns = self._rewrite_annotation(node.returns)
+        if hasattr(node, 'type_params'):
+            node.type_params = []
+
+        self._alias_scopes.append(dict(self._current_aliases()))
+        try:
+            node.body = self._visit_body(node.body)
+        finally:
+            self._alias_scopes.pop()
+        return node
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AsyncFunctionDef:
+        return self.visit_FunctionDef(node)
+
+    def visit_arg(self, node: ast.arg) -> ast.arg:
+        node.annotation = self._rewrite_annotation(node.annotation)
+        return node
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AnnAssign:
+        node.annotation = self._rewrite_annotation(node.annotation)
+        node.target = self.visit(node.target)
+        if node.value is not None:
+            node.value = self.visit(node.value)
+        return node
 
 
 class RewriteSympyEquality(ast.NodeTransformer):
@@ -493,12 +585,14 @@ class GlobalResolver(astutils.ExtNodeTransformer, astutils.ASTHelperMixin):
                  resolve_functions: bool = False,
                  default_args: Set[str] = None,
                  preserve_object_attributes: bool = False,
-                 preserve_raises: bool = False):
+                 preserve_raises: bool = False,
+                 preserve_fstrings: bool = False):
         self._globals = globals
         self.resolve_functions = resolve_functions
         self.default_args = default_args or set()
         self.preserve_object_attributes = preserve_object_attributes
         self.preserve_raises = preserve_raises
+        self.preserve_fstrings = preserve_fstrings
         self.current_scope = set()
         self.toplevel_function = True
         self.do_not_detect_callables = False
@@ -530,8 +624,8 @@ class GlobalResolver(astutils.ExtNodeTransformer, astutils.ASTHelperMixin):
             return False
 
         # User objects should remain attribute accesses in the preprocessed AST.
-        # The schedule-tree frontend can then decide whether to render them as
-        # direct attributes or as explicit protocol calls (__get__/__set__/etc.).
+        # The schedule-tree frontend can then decide whether to keep direct
+        # attribute syntax or rewrite it into explicit special-method calls.
         preserve_direct_attribute = True
 
         try:
@@ -630,9 +724,10 @@ class GlobalResolver(astutils.ExtNodeTransformer, astutils.ASTHelperMixin):
             newnode = ast.parse(symbolic.symstr(value)).body[0].value
         elif isinstance(value, ast.Name):
             newnode = ast.Name(id=value.id, ctx=ast.Load())
-        elif (dtypes.isconstant(value) or isinstance(value, (StringLiteral, SDFG)) or hasattr(value, '__sdfg__')):
-            # Could be a constant, an SDFG, or SDFG-convertible object
-            if isinstance(value, SDFG) or hasattr(value, '__sdfg__'):
+        elif (dtypes.isconstant(value) or isinstance(value, (StringLiteral, SDFG)) or hasattr(value, '__sdfg__')
+              or hasattr(value, '__schedule_tree__')):
+            # Could be a constant, an SDFG, or frontend-convertible object
+            if isinstance(value, SDFG) or hasattr(value, '__sdfg__') or hasattr(value, '__schedule_tree__'):
                 self.closure.closure_sdfgs[id(value)] = (qualname, value)
             elif isinstance(value, StringLiteral):
                 value = value.value
@@ -651,7 +746,8 @@ class GlobalResolver(astutils.ExtNodeTransformer, astutils.ASTHelperMixin):
             newnode = astutils.create_constant(value)
             newnode.qualname = qualname
 
-        elif detect_callables and hasattr(value, '__call__') and hasattr(value.__call__, '__sdfg__'):
+        elif detect_callables and hasattr(value, '__call__') and (hasattr(value.__call__, '__sdfg__')
+                                                                  or hasattr(value.__call__, '__schedule_tree__')):
             return self.global_value_to_node(value.__call__, parent_node, qualname, recurse, detect_callables)
         elif dtypes.is_array(value):
             # Arrays need to be stored as a new name and fed as an argument
@@ -1029,6 +1125,8 @@ class GlobalResolver(astutils.ExtNodeTransformer, astutils.ASTHelperMixin):
             global_val = astutils.evalnode(node, self.globals)
             return ast.copy_location(ast.Constant(kind='', value=global_val), node)
         except SyntaxError:
+            if self.preserve_fstrings:
+                return self.generic_visit(node)
             warnings.warn(f'f-string at line {node.lineno} could not '
                           'be fully evaluated in DaCe program, converting to '
                           'partially-evaluated string.')
@@ -1050,7 +1148,12 @@ class ContextManagerInliner(ast.NodeTransformer, astutils.ASTHelperMixin):
     a return statement, or top-level break/continue statements.
     """
 
-    def __init__(self, globals: Dict[str, Any], filename: str, closure_resolver: GlobalResolver) -> None:
+    def __init__(self,
+                 globals: Dict[str, Any],
+                 filename: str,
+                 closure_resolver: GlobalResolver,
+                 *,
+                 preserve_uninlinable_context_managers: bool = False) -> None:
         super().__init__()
         self.with_statements: List[ast.With] = []
         self.context_managers: Dict[ast.With, List[Tuple[str, Any]]] = {}
@@ -1058,6 +1161,7 @@ class ContextManagerInliner(ast.NodeTransformer, astutils.ASTHelperMixin):
         self.filename = filename
         self.resolver = closure_resolver
         self.names: Set[str] = set()
+        self.preserve_uninlinable_context_managers = preserve_uninlinable_context_managers
 
     def _visit_node_with_body(self, node):
         node = self.generic_visit_filtered(node, {'body'})
@@ -1155,7 +1259,13 @@ class ContextManagerInliner(ast.NodeTransformer, astutils.ASTHelperMixin):
         ifnode = ast.copy_location(ifnode, node)
 
         # Make enter calls
-        entries = self._add_entries(node)
+        try:
+            entries = self._add_entries(node)
+        except ValueError:
+            if self.preserve_uninlinable_context_managers:
+                self.with_statements.pop()
+                return node
+            raise
         ifnode.body = entries
 
         # Visit body
@@ -1481,19 +1591,15 @@ class IteratorForLoopNormalizer(ast.NodeTransformer):
 
     def _normalize_generic_zip_iteration(self, node: ast.For) -> Any:
         iterator_names = [self._fresh_name('iter') for _ in node.iter.args]
+        next_names = [self._fresh_name('iter_next') for _ in node.iter.args]
+        has_next_names = [self._fresh_name('iter_has_next') for _ in node.iter.args]
         value_names = [self._fresh_name('iter_value') for _ in node.iter.args]
-        sentinel_id = self._sentinel_name(node)
 
         init_nodes: List[ast.AST] = []
-        for iterator_name, value_name, arg in zip(iterator_names, value_names, node.iter.args):
+        for iterator_name, next_name, has_next_name, value_name, arg in zip(iterator_names, next_names, has_next_names,
+                                                                            value_names, node.iter.args):
             init_nodes.append(self._assign(iterator_name, self._helper_call('__dace_iterator_init', [arg]), node))
-            init_nodes.append(
-                self._assign(
-                    value_name,
-                    self._helper_call(
-                        '__dace_iterator_next',
-                        [ast.Name(id=iterator_name, ctx=ast.Load()),
-                         ast.Name(id=sentinel_id, ctx=ast.Load())]), node))
+            init_nodes.extend(self._iterator_next_sequence(iterator_name, next_name, has_next_name, value_name, node))
 
         yielded_value = ast.Tuple(elts=[ast.Name(id=value_name, ctx=ast.Load()) for value_name in value_names],
                                   ctx=ast.Load())
@@ -1506,42 +1612,28 @@ class IteratorForLoopNormalizer(ast.NodeTransformer):
             replacements = {}
 
         test = ast.BoolOp(op=ast.And(),
-                          values=[
-                              ast.Compare(left=ast.Name(id=value_name, ctx=ast.Load()),
-                                          ops=[ast.IsNot()],
-                                          comparators=[ast.Name(id=sentinel_id, ctx=ast.Load())])
-                              for value_name in value_names
-                          ])
+                          values=[ast.Name(id=has_next_name, ctx=ast.Load()) for has_next_name in has_next_names])
         body: List[ast.AST] = []
         if destructuring_setup is not None:
             body.append(destructuring_setup)
         body.extend(self._rewrite_body(node.body, replacements))
-        for iterator_name, value_name in zip(iterator_names, value_names):
-            body.append(
-                self._assign(
-                    value_name,
-                    self._helper_call(
-                        '__dace_iterator_next',
-                        [ast.Name(id=iterator_name, ctx=ast.Load()),
-                         ast.Name(id=sentinel_id, ctx=ast.Load())]), node))
+        for iterator_name, next_name, has_next_name, value_name in zip(iterator_names, next_names, has_next_names,
+                                                                       value_names):
+            body.extend(self._iterator_next_sequence(iterator_name, next_name, has_next_name, value_name, node))
 
         loop = ast.While(test=test, body=body, orelse=[astutils.copy_tree(stmt) for stmt in node.orelse])
         return [*init_nodes, ast.fix_missing_locations(ast.copy_location(loop, node))]
 
     def _normalize_generic_iteration(self, node: ast.For, enumerate_start: Optional[ast.AST] = None) -> Any:
         iterator_name = self._fresh_name('iter')
+        next_name = self._fresh_name('iter_next')
+        has_next_name = self._fresh_name('iter_has_next')
         value_name = self._fresh_name('iter_value')
-        sentinel_id = self._sentinel_name(node)
 
         init_nodes: List[ast.AST] = [
-            self._assign(iterator_name, self._helper_call('__dace_iterator_init', [node.iter]), node),
-            self._assign(
-                value_name,
-                self._helper_call(
-                    '__dace_iterator_next',
-                    [ast.Name(id=iterator_name, ctx=ast.Load()),
-                     ast.Name(id=sentinel_id, ctx=ast.Load())]), node),
+            self._assign(iterator_name, self._helper_call('__dace_iterator_init', [node.iter]), node)
         ]
+        init_nodes.extend(self._iterator_next_sequence(iterator_name, next_name, has_next_name, value_name, node))
 
         counter_name: Optional[str] = None
         if enumerate_start is not None:
@@ -1554,17 +1646,26 @@ class IteratorForLoopNormalizer(ast.NodeTransformer):
         else:
             yielded_value = ast.Name(id=value_name, ctx=ast.Load())
 
-        replacements = self._target_replacements(node.target, yielded_value)
-        destructuring_setup = None
-        if replacements is None:
-            destructuring_setup = self._destructuring_setup(node.target, yielded_value, node)
-            if destructuring_setup is None:
-                return node
+        target_setup: Optional[ast.Assign] = None
+        if self._requires_explicit_target_binding(node.target, node.body):
             replacements = {}
+            target_setup = self._binding_setup(node.target,
+                                               yielded_value,
+                                               node,
+                                               annotation=self._target_binding_annotation(node.target, node.body))
+            if target_setup is None:
+                return node
+        else:
+            replacements = self._target_replacements(node.target, yielded_value)
+            if replacements is None:
+                target_setup = self._destructuring_setup(node.target, yielded_value, node)
+                if target_setup is None:
+                    return node
+                replacements = {}
 
         body: List[ast.AST] = []
-        if destructuring_setup is not None:
-            body.append(destructuring_setup)
+        if target_setup is not None:
+            body.append(target_setup)
         body.extend(self._rewrite_body(node.body, replacements))
         if counter_name is not None:
             body.append(
@@ -1573,17 +1674,9 @@ class IteratorForLoopNormalizer(ast.NodeTransformer):
                     ast.BinOp(left=ast.Name(id=counter_name, ctx=ast.Load()),
                               op=ast.Add(),
                               right=astutils.create_constant(1, node)), node))
-        body.append(
-            self._assign(
-                value_name,
-                self._helper_call(
-                    '__dace_iterator_next',
-                    [ast.Name(id=iterator_name, ctx=ast.Load()),
-                     ast.Name(id=sentinel_id, ctx=ast.Load())]), node))
+        body.extend(self._iterator_next_sequence(iterator_name, next_name, has_next_name, value_name, node))
 
-        test = ast.Compare(left=ast.Name(id=value_name, ctx=ast.Load()),
-                           ops=[ast.IsNot()],
-                           comparators=[ast.Name(id=sentinel_id, ctx=ast.Load())])
+        test = ast.Name(id=has_next_name, ctx=ast.Load())
         loop = ast.While(test=test, body=body, orelse=[astutils.copy_tree(stmt) for stmt in node.orelse])
         return [*init_nodes, ast.fix_missing_locations(ast.copy_location(loop, node))]
 
@@ -1635,10 +1728,6 @@ class IteratorForLoopNormalizer(ast.NodeTransformer):
 
         return None
 
-    def _sentinel_name(self, node: ast.AST) -> str:
-        sentinel = self.resolver.global_value_to_node(object(), node, self._fresh_name('iter_end'), keep_object=True)
-        return sentinel.id
-
     def _fresh_name(self, prefix: str) -> str:
         name = f'__dace_{prefix}_{self._counter}'
         self._counter += 1
@@ -1663,9 +1752,31 @@ class IteratorForLoopNormalizer(ast.NodeTransformer):
                         args=[astutils.copy_tree(arg) for arg in args],
                         keywords=[])
 
+    def _iterator_next_sequence(self, iterator_name: str, next_name: str, has_next_name: str, value_name: str,
+                                location: ast.AST) -> List[ast.Assign]:
+        next_expr = ast.Name(id=next_name, ctx=ast.Load())
+        return [
+            self._assign(next_name,
+                         self._helper_call('__dace_iterator_next', [ast.Name(id=iterator_name, ctx=ast.Load())]),
+                         location),
+            self._assign_target(
+                ast.Name(id=has_next_name, ctx=ast.Store()),
+                ast.Subscript(value=astutils.copy_tree(next_expr),
+                              slice=astutils.create_constant(0, location),
+                              ctx=ast.Load()), location),
+            self._assign_target(
+                ast.Name(id=value_name, ctx=ast.Store()),
+                ast.Subscript(value=astutils.copy_tree(next_expr),
+                              slice=astutils.create_constant(1, location),
+                              ctx=ast.Load()), location)
+        ]
+
     def _assign(self, target_name: str, value: ast.AST, location: ast.AST) -> ast.Assign:
         return ast.fix_missing_locations(
             ast.copy_location(ast.Assign(targets=[ast.Name(id=target_name, ctx=ast.Store())], value=value), location))
+
+    def _assign_target(self, target: ast.AST, value: ast.AST, location: ast.AST) -> ast.Assign:
+        return ast.fix_missing_locations(ast.copy_location(ast.Assign(targets=[target], value=value), location))
 
     def _target_replacements(self, target: ast.AST, value: ast.AST) -> Optional[Dict[str, ast.AST]]:
         result: Dict[str, ast.AST] = {}
@@ -1697,6 +1808,37 @@ class IteratorForLoopNormalizer(ast.NodeTransformer):
             replace = astutils.ASTFindReplace({name: astutils.copy_tree(value) for name, value in replacements.items()})
             rewritten.append(ast.fix_missing_locations(replace.visit(copied)))
         return rewritten
+
+    def _requires_explicit_target_binding(self, target: ast.AST, body: List[ast.stmt]) -> bool:
+        return (isinstance(target, ast.Name) and any(
+            isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.target.id == target.id
+            for stmt in body))
+
+    def _target_binding_annotation(self, target: ast.AST, body: List[ast.stmt]) -> Optional[ast.AST]:
+        if not isinstance(target, ast.Name):
+            return None
+        for stmt in body:
+            if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.target.id == target.id:
+                return astutils.copy_tree(stmt.annotation)
+        return None
+
+    def _binding_setup(self,
+                       target: ast.AST,
+                       value: ast.AST,
+                       location: ast.AST,
+                       annotation: Optional[ast.AST] = None) -> Optional[ast.stmt]:
+        if isinstance(target, ast.Name) and annotation is not None:
+            return ast.fix_missing_locations(
+                ast.copy_location(
+                    ast.AnnAssign(target=astutils.copy_tree(target),
+                                  annotation=astutils.copy_tree(annotation),
+                                  value=astutils.copy_tree(value),
+                                  simple=1), location))
+        if isinstance(target, ast.Name):
+            return ast.fix_missing_locations(
+                ast.copy_location(ast.Assign(targets=[astutils.copy_tree(target)], value=astutils.copy_tree(value)),
+                                  location))
+        return self._destructuring_setup(target, value, location)
 
     def _destructuring_setup(self, target: ast.AST, value: ast.AST, location: ast.AST) -> Optional[ast.Assign]:
         if not isinstance(target, (ast.Tuple, ast.List)):
@@ -1927,10 +2069,11 @@ class DisallowedAssignmentChecker(ast.NodeVisitor):
     ``DaceSyntaxError`` exception if one is found.
     """
 
-    def __init__(self, filename: str) -> None:
+    def __init__(self, filename: str, preserve_call_expansions: bool = False) -> None:
         super().__init__()
         self.visitor = collections.namedtuple('Visitor', 'filename')
         self.visitor.filename = filename
+        self.preserve_call_expansions = preserve_call_expansions
 
     def _check_assignment_target(self, node: ast.expr, parent_node: ast.AST):
         if hasattr(node, 'qualname'):
@@ -1956,10 +2099,11 @@ class DisallowedAssignmentChecker(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call):
-        if any(k.arg is None for k in node.keywords):
+        if any(k.arg is None for k in node.keywords) and not self.preserve_call_expansions:
             raise DaceSyntaxError(
                 self.visitor, node, 'Double-starred (dictionary unpacking, e.g., `**a`) arguments are '
                 'currently unsupported.')
+        self.generic_visit(node)
 
 
 class NamedExprDesugarer(ast.NodeTransformer):
@@ -2355,7 +2499,10 @@ def preprocess_dace_program(f: Callable[..., Any],
                             normalize_generic_for_loops: bool = False,
                             preserve_object_attributes: bool = False,
                             disallowed_stmts: Optional[Set[str]] = None,
-                            preserve_raises: bool = False) -> Tuple[PreprocessedAST, SDFGClosure]:
+                            preserve_raises: bool = False,
+                            preserve_fstrings: bool = False,
+                            preserve_uninlinable_context_managers: bool = False,
+                            preserve_call_expansions: bool = False) -> Tuple[PreprocessedAST, SDFGClosure]:
     """
     Preprocesses a ``@dace.program`` and all its nested functions, returning
     a preprocessed AST object and the closure of the resulting SDFG.
@@ -2378,12 +2525,24 @@ def preprocess_dace_program(f: Callable[..., Any],
     :param preserve_raises: If True, keep ``raise`` statements in the
                             preprocessed AST for downstream frontends to
                             handle explicitly.
+    :param preserve_fstrings: If True, keep non-constant f-string AST nodes
+                              in the preprocessed AST for downstream
+                              frontends to handle explicitly.
+    :param preserve_uninlinable_context_managers: If True, leave ``with`` /
+                              ``async with`` statements in the AST when the
+                              context manager cannot be created at compile
+                              time, so downstream frontends can decide how to
+                              handle them.
+    :param preserve_call_expansions: If True, leave calls that use ``**``
+                              argument expansion in the AST so downstream
+                              frontends can represent them explicitly.
     :return: A 2-tuple of the AST and its reduced (used) closure.
     """
     src_ast, src_file, src_line, src = astutils.function_to_ast(f)
 
     # Resolve data structures
     src_ast = StructTransformer(global_vars).visit(src_ast)
+    src_ast = TypeAliasResolver(src_file).visit(src_ast)
 
     src_ast = ModuleResolver(modules).visit(src_ast)
     # Convert modules after resolution
@@ -2411,7 +2570,8 @@ def preprocess_dace_program(f: Callable[..., Any],
                                       resolve_functions,
                                       default_args=default_args,
                                       preserve_object_attributes=preserve_object_attributes,
-                                      preserve_raises=preserve_raises)
+                                      preserve_raises=preserve_raises,
+                                      preserve_fstrings=preserve_fstrings)
 
     # Append element to call stack and handle max recursion depth
     if parent_closure is not None:
@@ -2459,14 +2619,18 @@ def preprocess_dace_program(f: Callable[..., Any],
         try:
             closure_resolver.toplevel_function = True
             src_ast = closure_resolver.visit(src_ast)
-            DisallowedAssignmentChecker(src_file).visit(src_ast)
+            DisallowedAssignmentChecker(src_file, preserve_call_expansions=preserve_call_expansions).visit(src_ast)
             if normalize_generic_for_loops:
                 src_ast = ComprehensionDesugarer().visit(src_ast)
             src_ast = LoopUnroller(resolved, src_file, closure_resolver).visit(src_ast)
             if normalize_generic_for_loops:
                 src_ast = IteratorForLoopNormalizer(resolved, argtypes, closure_resolver).visit(src_ast)
             src_ast = ExpressionInliner(resolved, src_file, closure_resolver).visit(src_ast)
-            src_ast = ContextManagerInliner(resolved, src_file, closure_resolver).visit(src_ast)
+            src_ast = ContextManagerInliner(
+                resolved,
+                src_file,
+                closure_resolver,
+                preserve_uninlinable_context_managers=preserve_uninlinable_context_managers).visit(src_ast)
             src_ast = ConditionalCodeResolver(resolved, preserve_raises=preserve_raises).visit(src_ast)
             if normalize_generic_for_loops:
                 src_ast = NamedExprDesugarer().visit(src_ast)

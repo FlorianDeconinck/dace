@@ -1,12 +1,16 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 
 import ast
+import contextlib
 import numpy as np
 import pytest
+import sys
+import warnings
 from typing import Optional
 
 import dace
-from dace.frontend.python.common import DaceSyntaxError
+from dace.data.pydata import PythonList
+from dace.frontend.python.common import DaceSyntaxError, SDFGConvertible, ScheduleTreeConvertible
 from dace.sdfg.analysis.schedule_tree import treenodes as tn
 
 
@@ -120,203 +124,6 @@ def test_python_frontend_schedule_tree_map_scope():
     assert isinstance(stree.children[0].children[0], tn.CopyNode)
 
 
-def test_python_frontend_schedule_tree_numpy_elementwise_assignment_and_update():
-
-    @dace.program
-    def computed(A: dace.float64[8], B: dace.float64[8], out: dace.float64[8]):
-        out[:] = A[:] + B[:]
-        out[:] += A[:]
-
-    stree = computed.to_schedule_tree()
-
-    assert isinstance(stree.children[0], tn.MapScope)
-    assert isinstance(stree.children[0].node, tn.FrontendMap)
-    assert isinstance(stree.children[0].children[0], tn.TaskletNode)
-    assert isinstance(stree.children[0].children[0].node, tn.FrontendTasklet)
-    assert len(stree.children[0].children[0].in_memlets) == 2
-    assert isinstance(stree.children[1], tn.MapScope)
-    assert isinstance(stree.children[1].node, tn.FrontendMap)
-    assert isinstance(stree.children[1].children[0], tn.TaskletNode)
-    assert isinstance(stree.children[1].children[0].node, tn.FrontendTasklet)
-    assert len(stree.children[1].children[0].in_memlets) == 2
-
-
-def test_python_frontend_schedule_tree_numpy_broadcast_map():
-
-    @dace.program
-    def computed(A: dace.float64[2, 3], B: dace.float64[3], out: dace.float64[2, 3]):
-        out[:] = A[:] + B
-
-    stree = computed.to_schedule_tree()
-
-    assert isinstance(stree.children[0], tn.MapScope)
-    assert isinstance(stree.children[0].node, tn.FrontendMap)
-    assert len(stree.children[0].node.params) == 2
-    tasklet = stree.children[0].children[0]
-    assert isinstance(tasklet, tn.TaskletNode)
-    assert str(tasklet.in_memlets['in1'].subset) == '__i1'
-
-
-def test_python_frontend_schedule_tree_numpy_map_inside_loop_with_scalar_index():
-
-    @dace.program
-    def computed(A: dace.float64[8], out: dace.float64[8]):
-        ref1: dace.data.ArrayReference(A.dtype, A.shape) = A
-        ref2: dace.data.ArrayReference(out.dtype, out.shape) = out
-        for i in range(8):
-            ref2[:] = ref1[:] + i * ref1[2]
-
-    stree = computed.to_schedule_tree()
-
-    assert isinstance(stree.children[0], tn.RefSetNode)
-    assert isinstance(stree.children[1], tn.RefSetNode)
-    assert isinstance(stree.children[2], tn.LoopScope)
-    assert isinstance(stree.children[2].children[0], tn.MapScope)
-    tasklet = stree.children[2].children[0].children[0]
-    assert isinstance(tasklet, tn.TaskletNode)
-    assert tasklet.node.code.as_string == 'out = (in0 + (i * in1))'
-
-
-def test_python_frontend_schedule_tree_advanced_indexing_is_copy_not_view():
-
-    @dace.program
-    def advanced_prog(A: dace.float64[8], ind: dace.int32[4]):
-        basic = A[1:5]
-        advanced = A[ind]
-        return advanced
-
-    stree = advanced_prog.to_schedule_tree()
-
-    assert isinstance(stree.children[0], tn.ViewNode)
-    assert isinstance(stree.children[1], tn.MapScope)
-    assert isinstance(stree.children[1].children[0], tn.TaskletNode)
-    assert stree.children[1].children[0].node.code.as_string == 'out = in0[idx0_0]'
-    assert isinstance(stree.children[2], tn.ReturnNode)
-
-
-def test_python_frontend_schedule_tree_advanced_indexing_expression_map():
-
-    @dace.program
-    def advanced_prog(A: dace.float64[8], ind: dace.int32[4], B: dace.float64[4], out: dace.float64[4]):
-        out[:] = A[ind] + B[:]
-
-    stree = advanced_prog.to_schedule_tree()
-
-    assert isinstance(stree.children[0], tn.MapScope)
-    tasklet = stree.children[0].children[0]
-    assert isinstance(tasklet, tn.TaskletNode)
-    assert len(tasklet.in_memlets) == 3
-    assert tasklet.node.code.as_string == 'out = (in0[idx0_0] + in1)'
-
-
-def test_python_frontend_schedule_tree_multidim_advanced_indexing_expression_map():
-
-    @dace.program
-    def advanced_prog(A: dace.float64[6, 6], I: dace.int32[4], J: dace.int32[4], out: dace.float64[4]):
-        out[:] = A[I, J]
-
-    stree = advanced_prog.to_schedule_tree()
-
-    assert isinstance(stree.children[0], tn.MapScope)
-    tasklet = stree.children[0].children[0]
-    assert isinstance(tasklet, tn.TaskletNode)
-    assert len(tasklet.in_memlets) == 3
-    assert tasklet.node.code.as_string == 'out = in0[idx0_0, idx0_1]'
-
-
-def test_python_frontend_schedule_tree_advanced_indexing_target_assign():
-
-    @dace.program
-    def advanced_prog(A: dace.float64[8], ind: dace.int32[4]):
-        A[ind] = 2
-
-    stree = advanced_prog.to_schedule_tree()
-
-    assert isinstance(stree.children[0], tn.MapScope)
-    tasklet = stree.children[0].children[0]
-    assert isinstance(tasklet, tn.TaskletNode)
-    assert len(tasklet.in_memlets) == 1
-    assert tasklet.node.code.as_string == 'out[outidx_0] = 2'
-
-
-def test_python_frontend_schedule_tree_advanced_indexing_target_augassign():
-
-    @dace.program
-    def advanced_prog(A: dace.float64[8], ind: dace.int32[4], B: dace.float64[4]):
-        A[ind] += B
-
-    stree = advanced_prog.to_schedule_tree()
-
-    assert isinstance(stree.children[0], tn.MapScope)
-    tasklet = stree.children[0].children[0]
-    assert isinstance(tasklet, tn.TaskletNode)
-    assert len(tasklet.in_memlets) == 4
-    assert tasklet.node.code.as_string == 'out[outidx_0] = (in0[idx0_0] + in1)'
-
-
-def test_python_frontend_schedule_tree_advanced_indexing_target_mixed_range():
-
-    @dace.program
-    def advanced_prog(A: dace.float64[20, 20, 20], ind: dace.int32[4]):
-        A[1:2, ind, 3:10] = 2
-
-    stree = advanced_prog.to_schedule_tree()
-
-    assert isinstance(stree.children[0], tn.MapScope)
-    assert len(stree.children[0].node.params) == 2
-    tasklet = stree.children[0].children[0]
-    assert isinstance(tasklet, tn.TaskletNode)
-    assert tasklet.node.code.as_string == 'out[outidx_0] = 2'
-
-
-def test_python_frontend_schedule_tree_boolean_mask_target_augassign():
-
-    @dace.program
-    def advanced_prog(A: dace.float64[20, 30], barr: dace.bool_[20, 30]):
-        A[barr] += 5
-
-    stree = advanced_prog.to_schedule_tree()
-
-    assert isinstance(stree.children[0], tn.MapScope)
-    assert len(stree.children[0].node.params) == 2
-    tasklet = stree.children[0].children[0]
-    assert isinstance(tasklet, tn.TaskletNode)
-    assert 'if mask:' in tasklet.node.code.as_string
-    assert 'out = (cur + 5)' in tasklet.node.code.as_string
-
-
-def test_python_frontend_schedule_tree_boolean_mask_target_inline_assign():
-
-    @dace.program
-    def advanced_prog(A: dace.float64[20, 30]):
-        A[A > 15] = 2
-
-    stree = advanced_prog.to_schedule_tree()
-
-    assert isinstance(stree.children[0], tn.MapScope)
-    assert len(stree.children[0].node.params) == 2
-    tasklet = stree.children[0].children[0]
-    assert isinstance(tasklet, tn.TaskletNode)
-    assert 'if (in100 > 15):' in tasklet.node.code.as_string
-    assert 'out = 2' in tasklet.node.code.as_string
-
-
-def test_python_frontend_schedule_tree_numpy_ufunc_map():
-
-    @dace.program
-    def called(A: dace.float64[8], out: dace.float64[8]):
-        out[:] = np.sqrt(A[:])
-
-    stree = called.to_schedule_tree()
-
-    assert len(stree.children) == 1
-    assert isinstance(stree.children[0], tn.MapScope)
-    assert isinstance(stree.children[0].node, tn.FrontendMap)
-    tasklet = stree.children[0].children[0]
-    assert isinstance(tasklet, tn.TaskletNode)
-    assert tasklet.node.code.as_string == 'out = numpy.sqrt(in0)'
-
-
 def test_python_frontend_schedule_tree_function_call_return():
 
     @dace.program
@@ -396,6 +203,115 @@ def test_python_frontend_schedule_tree_function_call_assignment():
     assert len(call_scope.children) >= 1
 
 
+def test_python_frontend_schedule_tree_external_schedule_tree_convertible_call():
+
+    class Convertible(ScheduleTreeConvertible):
+
+        def __init__(self):
+
+            @dace.program
+            def inner(A: dace.float64[8], B: dace.float64[8]):
+                return A + B
+
+            self.inner = inner
+
+        def __schedule_tree__(self, *args, lambda_bindings=None, callable_bindings=None, **kwargs):
+            return self.inner.__schedule_tree__(*args,
+                                                lambda_bindings=lambda_bindings,
+                                                callable_bindings=callable_bindings,
+                                                **kwargs)
+
+        def __schedule_tree_signature__(self):
+            return (['A', 'B'], [])
+
+    convertible = Convertible()
+
+    @dace.program
+    def outer(A: dace.float64[8], B: dace.float64[8]):
+        return convertible(A + 1, B + 2)
+
+    stree = outer.to_schedule_tree()
+
+    assert len(stree.children) == 4
+    assert isinstance(stree.children[0], tn.MapScope)
+    assert isinstance(stree.children[1], tn.MapScope)
+    call_scope = stree.children[2]
+    assert isinstance(call_scope, tn.FunctionCallScope)
+    assert call_scope.call.callee_name == 'Convertible'
+    assert call_scope.call.arguments == {'A': '__stree_tmp', 'B': '__stree_tmp1'}
+    assert len(call_scope.children) >= 1
+    assert isinstance(stree.children[3], tn.ReturnNode)
+
+
+def test_python_frontend_schedule_tree_sdfg_call_stays_opaque():
+
+    @dace.program
+    def inner(A: dace.float64[8], B: dace.float64[8]):
+        return A + B
+
+    sdfg_obj = inner.to_sdfg()
+
+    @dace.program
+    def outer(A: dace.float64[8], B: dace.float64[8]):
+        return sdfg_obj(A, B)
+
+    stree = outer.to_schedule_tree()
+
+    assert not any(isinstance(node, tn.FunctionCallScope) for node in stree.preorder_traversal())
+    assert not any(isinstance(node, tn.PythonCallbackNode) for node in stree.preorder_traversal())
+    assert isinstance(stree.children[0], tn.SDFGCallNode)
+    assert isinstance(stree.children[0].sdfg, dace.SDFG)
+    assert stree.children[0].sdfg.name == sdfg_obj.name
+    assert stree.children[0].call.callee_name.endswith('inner')
+    assert stree.children[0].call.arguments == {'A': 'A', 'B': 'B'}
+    assert stree.children[0].return_targets == ['__stree_retval']
+    assert isinstance(stree.children[1], tn.ReturnNode)
+    assert stree.children[1].values[0].as_string == '__stree_retval'
+
+
+def test_python_frontend_schedule_tree_sdfg_convertible_call_stays_opaque():
+
+    class Convertible(SDFGConvertible):
+
+        def __init__(self):
+            self.name = 'convertible'
+
+        def __call__(self, *args, **kwargs):
+            raise AssertionError('SDFGConvertible should not execute during schedule-tree generation')
+
+        def __sdfg__(self, A, B):
+
+            @dace.program
+            def inner(X: dace.float64[8], Y: dace.float64[8]):
+                return X + Y
+
+            return inner.to_sdfg(A, B)
+
+        def __sdfg_signature__(self):
+            return (['A', 'B'], [])
+
+        def __sdfg_closure__(self, reevaluate=None):
+            return {}
+
+    convertible = Convertible()
+
+    @dace.program
+    def outer(A: dace.float64[8], B: dace.float64[8]):
+        return convertible(A, B)
+
+    stree = outer.to_schedule_tree()
+
+    assert not any(isinstance(node, tn.FunctionCallScope) for node in stree.preorder_traversal())
+    assert not any(isinstance(node, tn.PythonCallbackNode) for node in stree.preorder_traversal())
+    assert isinstance(stree.children[0], tn.SDFGCallNode)
+    assert isinstance(stree.children[0].sdfg, dace.SDFG)
+    assert stree.children[0].call.callee_name == 'convertible'
+    assert stree.children[0].call.arguments == {'A': 'A', 'B': 'B'}
+    assert stree.children[0].return_targets == ['__stree_retval']
+    assert isinstance(stree.children[1], tn.ReturnNode)
+    assert stree.children[1].values[0].as_string == '__stree_retval'
+
+
 def test_python_frontend_schedule_tree_return_materializes_array_expression():
 
     @dace.program
@@ -408,6 +324,23 @@ def test_python_frontend_schedule_tree_return_materializes_array_expression():
     assert isinstance(stree.children[0], tn.MapScope)
     assert isinstance(stree.children[1], tn.ReturnNode)
     assert stree.children[1].values[0].as_string == '__stree_tmp'
+
+
+def test_python_frontend_schedule_tree_compile_time_fstring_stays_direct():
+
+    prefix = 'value='
+
+    @dace.program
+    def returned():
+        tmp = f'{prefix}5'
+        return tmp
+
+    stree = returned.to_schedule_tree()
+
+    assert stree.containers['tmp'].dtype == dace.dtypes.string
+    assert isinstance(stree.children[0], tn.AssignNode)
+    assert isinstance(stree.children[1], tn.ReturnNode)
+    assert not any(isinstance(node, tn.PythonCallbackNode) for node in stree.preorder_traversal())
 
 
 def test_python_frontend_schedule_tree_matmul_chain_library_calls():
@@ -676,9 +609,18 @@ def test_python_frontend_schedule_tree_generic_iterator_fallback():
 
     assert isinstance(stree.children[0], tn.AssignNode)
     assert isinstance(stree.children[1], tn.AssignNode)
-    assert isinstance(stree.children[2], tn.LoopScope)
-    assert isinstance(stree.children[2].loop, tn.FrontendLoop)
-    assert isinstance(stree.children[2].children[0], tn.CopyNode)
+    assert isinstance(stree.children[2], tn.AssignNode)
+    assert isinstance(stree.children[3], tn.AssignNode)
+    assert isinstance(stree.children[4], tn.LoopScope)
+    assert isinstance(stree.children[4].loop, tn.FrontendLoop)
+    assert stree.children[4].loop.loop_condition.as_string == '__dace_iter_has_next_2'
+    assert isinstance(stree.children[4].children[0], tn.CopyNode)
+    assert isinstance(stree.children[4].children[1], tn.AssignNode)
+    assert stree.children[4].children[1].name == '__dace_iter_next_1'
+    assert isinstance(stree.children[4].children[2], tn.AssignNode)
+    assert stree.children[4].children[2].name == '__dace_iter_has_next_2'
+    assert isinstance(stree.children[4].children[3], tn.AssignNode)
+    assert stree.children[4].children[3].name == '__dace_iter_value_3'
 
 
 def test_python_frontend_schedule_tree_generic_iterator_inference_has_no_runtime_side_effect():
@@ -702,8 +644,8 @@ def test_python_frontend_schedule_tree_generic_iterator_inference_has_no_runtime
     stree = iter_prog.to_schedule_tree()
 
     assert counter.iter_calls == 0
-    assert isinstance(stree.children[2], tn.LoopScope)
-    assert isinstance(stree.children[2].children[0], tn.CopyNode)
+    assert isinstance(stree.children[4], tn.LoopScope)
+    assert isinstance(stree.children[4].children[0], tn.CopyNode)
 
 
 def test_python_frontend_schedule_tree_generic_iterator_tuple_value():
@@ -724,8 +666,10 @@ def test_python_frontend_schedule_tree_generic_iterator_tuple_value():
 
     assert isinstance(stree.children[0], tn.AssignNode)
     assert isinstance(stree.children[1], tn.AssignNode)
-    assert isinstance(stree.children[2], tn.LoopScope)
-    assert isinstance(stree.children[2].children[0], tn.TaskletNode)
+    assert isinstance(stree.children[2], tn.AssignNode)
+    assert isinstance(stree.children[3], tn.AssignNode)
+    assert isinstance(stree.children[4], tn.LoopScope)
+    assert isinstance(stree.children[4].children[0], tn.TaskletNode)
 
 
 def test_python_frontend_schedule_tree_generic_iterator_fallback_destructuring():
@@ -746,10 +690,230 @@ def test_python_frontend_schedule_tree_generic_iterator_fallback_destructuring()
 
     assert isinstance(stree.children[0], tn.AssignNode)
     assert isinstance(stree.children[1], tn.AssignNode)
-    assert isinstance(stree.children[2], tn.LoopScope)
-    assert isinstance(stree.children[2].loop, tn.FrontendLoop)
-    assert isinstance(stree.children[2].children[0], tn.StatementNode)
-    assert isinstance(stree.children[2].children[1], tn.TaskletNode)
+    assert isinstance(stree.children[2], tn.AssignNode)
+    assert isinstance(stree.children[3], tn.AssignNode)
+    assert isinstance(stree.children[4], tn.LoopScope)
+    assert isinstance(stree.children[4].loop, tn.FrontendLoop)
+    assert isinstance(stree.children[4].children[0], tn.StatementNode)
+    assert stree.children[4].children[0].code.as_string == '(a, b) = __dace_iter_value_3'
+    assert isinstance(stree.children[4].children[1], tn.TaskletNode)
+    assert isinstance(stree.children[4].children[2], tn.AssignNode)
+    assert isinstance(stree.children[4].children[3], tn.AssignNode)
+    assert isinstance(stree.children[4].children[4], tn.AssignNode)
+
+
+def test_python_frontend_schedule_tree_generic_iterator_generator_object():
+
+    def reverse_range(sz):
+        cur = sz
+        for _ in range(sz):
+            yield float(cur)
+            cur -= 1
+
+    generator = reverse_range(3)
+
+    @dace.program
+    def iter_prog(out: dace.float64[4]):
+        for val in dace.nounroll(generator):
+            out[0] = val
+
+    stree = iter_prog.to_schedule_tree()
+
+    assert isinstance(stree.children[0], tn.AssignNode)
+    assert isinstance(stree.children[1], tn.AssignNode)
+    assert isinstance(stree.children[2], tn.AssignNode)
+    assert isinstance(stree.children[3], tn.AssignNode)
+    assert isinstance(stree.children[4], tn.LoopScope)
+    assert isinstance(stree.children[4].loop, tn.FrontendLoop)
+    assert isinstance(stree.children[4].children[0], tn.CopyNode)
+    assert not any(isinstance(node, tn.PythonCallbackNode) for node in stree.preorder_traversal())
+    assert next(generator) == 3.0
+
+
+def test_python_frontend_schedule_tree_tuple_of_arrays_unrolls():
+
+    @dace.program
+    def iter_prog(a: dace.float64[2, 3, 4], b: dace.float64[2, 3, 4], c: dace.float64[2, 3, 4], out: dace.float64[2, 3,
+                                                                                                                  4]):
+        for arr in (a, b, c):
+            out[:] = arr
+
+    with pytest.warns(UserWarning, match=r'implicitly unrolled'):
+        stree = iter_prog.to_schedule_tree()
+
+    assert [type(child) for child in stree.children] == [tn.CopyNode, tn.CopyNode, tn.CopyNode]
+    assert [child.memlet.data for child in stree.children] == ['a', 'b', 'c']
+
+
+def test_python_frontend_schedule_tree_nounroll_array_annotation_binds_reference():
+
+    @dace.program
+    def iter_prog(a: dace.float64[2, 3, 4], b: dace.float64[2, 3, 4], c: dace.float64[2, 3, 4], out: dace.float64[2, 3,
+                                                                                                                  4]):
+        list_of_arrays = [a, b, c]
+        for arr in dace.nounroll(list_of_arrays):
+            arr: dace.float64[2, 3, 4]
+            out[:] = arr
+
+    stree = iter_prog.to_schedule_tree()
+
+    assert isinstance(stree.children[0], tn.StatementNode)
+    assert stree.children[0].code.as_string == 'list_of_arrays = [a, b, c]'
+    assert isinstance(stree.containers['list_of_arrays'], PythonList)
+    assert isinstance(stree.children[1], tn.AssignNode)
+    assert stree.children[1].name == '__dace_iter_0'
+    assert isinstance(stree.children[2], tn.AssignNode)
+    assert stree.children[2].name == '__dace_iter_next_1'
+    assert isinstance(stree.children[3], tn.AssignNode)
+    assert stree.children[3].name == '__dace_iter_has_next_2'
+    assert isinstance(stree.children[4], tn.AssignNode)
+    assert stree.children[4].name == '__dace_iter_value_3'
+    assert isinstance(stree.children[5], tn.LoopScope)
+    assert stree.children[5].loop.loop_condition.as_string == '__dace_iter_has_next_2'
+    assert isinstance(stree.children[5].children[0], tn.RefSetNode)
+    assert stree.children[5].children[0].target == 'arr'
+    assert isinstance(stree.children[5].children[1], tn.CopyNode)
+    assert stree.children[5].children[1].memlet.data == 'arr'
+    assert isinstance(stree.children[5].children[2], tn.AssignNode)
+    assert stree.children[5].children[2].name == '__dace_iter_next_1'
+    assert isinstance(stree.children[5].children[3], tn.AssignNode)
+    assert stree.children[5].children[3].name == '__dace_iter_has_next_2'
+    assert isinstance(stree.children[5].children[4], tn.AssignNode)
+    assert stree.children[5].children[4].name == '__dace_iter_value_3'
+    assert '__dace_iter_end_' not in stree.as_string()
+
+
+def test_python_frontend_schedule_tree_free_iter_and_next_calls():
+
+    def reverse_range(sz):
+        cur = sz
+        for _ in range(sz):
+            yield float(cur)
+            cur -= 1
+
+    generator = reverse_range(3)
+
+    @dace.program
+    def iter_prog(out: dace.float64[3]):
+        it = iter(generator)
+        out[0] = next(it)
+        out[1] = next(it)
+        out[2] = next(it)
+
+    stree = iter_prog.to_schedule_tree()
+
+    assert isinstance(stree.children[0], tn.PythonCallbackNode)
+    assert stree.children[0].reason == 'pyobject call'
+    assert stree.children[0].code.as_string == 'it = iter(generator)'
+    assert stree.children[0].outlined_function_name.startswith('__stree_callback')
+    assert stree.children[0].outlined_function_code.as_string.startswith(
+        f'def {stree.children[0].outlined_function_name}():')
+    assert stree.children[0].outlined_call_code.as_string == f'it = {stree.children[0].outlined_function_name}()'
+    for index, child in enumerate(stree.children[1:]):
+        assert isinstance(child, tn.TaskletNode)
+        assert child.node.code.as_string == f'out[{index}] = next(it)'
+    assert len([node for node in stree.preorder_traversal() if isinstance(node, tn.PythonCallbackNode)]) == 1
+    assert next(generator) == 3.0
+
+
+def test_python_frontend_schedule_tree_internal_generator_with_next_calls():
+
+    def reverse_range(sz):
+        cur = sz
+        for _ in range(sz):
+            yield float(cur)
+            cur -= 1
+
+    @dace.program
+    def iter_prog(out: dace.float64[3]):
+        gen = reverse_range(3)
+        out[0] = next(gen)
+        out[1] = next(gen)
+        out[2] = next(gen)
+
+    stree = iter_prog.to_schedule_tree()
+
+    assert isinstance(stree.children[0], tn.PythonCallbackNode)
+    assert stree.children[0].reason == 'pyobject call'
+    assert stree.children[0].code.as_string == 'gen = reverse_range(3)'
+    for index, child in enumerate(stree.children[1:]):
+        assert isinstance(child, tn.TaskletNode)
+        assert child.node.code.as_string == f'out[{index}] = next(gen)'
+    assert len([node for node in stree.preorder_traversal() if isinstance(node, tn.PythonCallbackNode)]) == 1
+
+
+def test_python_frontend_schedule_tree_next_iter_dict_values():
+
+    @dace.program
+    def iter_prog(out: dace.int64[1]):
+        x = {1: 1, 2: 2, 3: 3}
+        out[0] = next(iter(x.values()))
+
+    stree = iter_prog.to_schedule_tree()
+
+    assert isinstance(stree.children[0], tn.AssignNode)
+    assert stree.children[0].name == 'x'
+    assert stree.children[0].value.as_string == '{1: 1, 2: 2, 3: 3}'
+    assert isinstance(stree.children[1], tn.PythonCallbackNode)
+    assert stree.children[1].reason == 'pyobject call'
+    assert stree.children[1].code.as_string == '__stree_tmp = x.values()'
+    assert isinstance(stree.children[2], tn.PythonCallbackNode)
+    assert stree.children[2].reason == 'pyobject call'
+    assert stree.children[2].code.as_string == '__stree_tmp1 = iter(__stree_tmp)'
+    assert isinstance(stree.children[3], tn.TaskletNode)
+    assert stree.children[3].node.code.as_string == 'out[0] = next(__stree_tmp1)'
+    assert len([node for node in stree.preorder_traversal() if isinstance(node, tn.PythonCallbackNode)]) == 2
+
+
+def test_python_frontend_schedule_tree_untyped_next_warns():
+
+    def reverse_range(sz):
+        cur = sz
+        for _ in range(sz):
+            yield float(cur)
+            cur -= 1
+
+    @dace.program
+    def iter_prog(out: dace.float64[1]):
+        gen = reverse_range(3)
+        val = next(gen)
+        out[0] = val
+
+    with pytest.warns(UserWarning,
+                      match=r'Could not infer the result type of iterator next\(\) in schedule-tree lowering'):
+        stree = iter_prog.to_schedule_tree()
+
+    assert isinstance(stree.children[0], tn.PythonCallbackNode)
+    assert stree.children[0].code.as_string == 'gen = reverse_range(3)'
+    assert isinstance(stree.children[1], tn.PythonCallbackNode)
+    assert stree.children[1].code.as_string == 'val = next(gen)'
+    assert isinstance(stree.children[2], tn.CopyNode)
+
+
+def test_python_frontend_schedule_tree_annotated_next_assignment_is_typed():
+
+    def reverse_range(sz):
+        cur = sz
+        for _ in range(sz):
+            yield float(cur)
+            cur -= 1
+
+    @dace.program
+    def iter_prog(out: dace.float64[1]):
+        gen = reverse_range(3)
+        val: dace.float64 = next(gen)
+        out[0] = val
+
+    with pytest.raises(pytest.fail.Exception, match='DID NOT WARN'):
+        with pytest.warns(UserWarning,
+                          match=r'Could not infer the result type of iterator next\(\) in schedule-tree lowering'):
+            stree = iter_prog.to_schedule_tree()
+
+    assert isinstance(stree.children[0], tn.PythonCallbackNode)
+    assert stree.children[0].code.as_string == 'gen = reverse_range(3)'
+    assert isinstance(stree.children[1], tn.TaskletNode)
+    assert stree.children[1].node.code.as_string == 'val = next(gen)'
+    assert isinstance(stree.children[2], tn.CopyNode)
 
 
 def test_python_frontend_schedule_tree_tuple_swap_statement():
@@ -793,11 +957,89 @@ def test_python_frontend_schedule_tree_starred_unpacking_uses_analyzable_structu
 
     stree = starred_prog.to_schedule_tree()
 
-    assert isinstance(stree.children[0], tn.StatementNode)
-    assert stree.children[0].code.as_string == '__stree_tuple_tmp = (A, B, C)'
+    assert isinstance(stree.children[0], (tn.RefSetNode, tn.ViewNode))
+    assert stree.children[0].target == 'head'
     assert isinstance(stree.children[1], tn.StatementNode)
-    assert stree.children[1].code.as_string == '(head, *rest) = __stree_tuple_tmp'
+    assert stree.children[1].code.as_string == 'rest = [B, C]'
     assert isinstance(stree.children[2], tn.CopyNode)
+    assert not any(isinstance(node, tn.PythonCallbackNode) for node in stree.preorder_traversal())
+
+
+def test_python_frontend_schedule_tree_star_call_expansion_is_resolved_statically():
+
+    def callee(a, b, c):
+        return a + b + c
+
+    @dace.program
+    def star_call_prog(A: dace.float64[4], B: dace.float64[4], C: dace.float64[4]):
+        args = (A, B)
+        return callee(*args, c=C)
+
+    stree = star_call_prog.to_schedule_tree()
+
+    assert isinstance(stree.children[0], tn.StatementNode)
+    assert stree.children[0].code.as_string == 'args = (A, B)'
+    assert isinstance(stree.children[1], tn.FunctionCallScope)
+    assert stree.children[1].call.callee_name == 'callee'
+    assert stree.children[1].call.arguments == {'a': 'A', 'b': 'B', 'c': 'C'}
+    assert isinstance(stree.children[2], tn.ReturnNode)
+    assert stree.children[2].values[0].as_string == '__stree_retval'
+    assert not any(isinstance(node, tn.PythonCallbackNode) for node in stree.preorder_traversal())
+
+
+def test_python_frontend_schedule_tree_double_star_call_expansion_is_resolved_statically():
+
+    def callee(a, b, c):
+        return a + b + c
+
+    @dace.program
+    def dstar_call_prog(A: dace.float64[4], B: dace.float64[4], C: dace.float64[4]):
+        kwargs = {'c': C}
+        return callee(A, B, **kwargs)
+
+    stree = dstar_call_prog.to_schedule_tree()
+
+    assert isinstance(stree.children[0], tn.TaskletNode)
+    assert isinstance(stree.children[1], tn.FunctionCallScope)
+    assert stree.children[1].call.callee_name == 'callee'
+    assert stree.children[1].call.arguments == {'a': 'A', 'b': 'B', 'c': 'C'}
+    assert isinstance(stree.children[2], tn.ReturnNode)
+    assert stree.children[2].values[0].as_string == '__stree_retval'
+    assert not any(isinstance(node, tn.PythonCallbackNode) for node in stree.preorder_traversal())
+
+
+def test_python_frontend_schedule_tree_dynamic_star_call_expansion_uses_callback():
+
+    def callee(a, b, c):
+        return a + b + c
+
+    @dace.program
+    def dynamic_star_call(flag: dace.bool_, A: dace.float64[4], B: dace.float64[4], C: dace.float64[4]):
+        return callee(*((A, B) if flag else (B, A)), c=C)
+
+    stree = dynamic_star_call.to_schedule_tree()
+
+    assert isinstance(stree.children[0], tn.PythonCallbackNode)
+    assert stree.children[0].reason == 'call expansion'
+    assert stree.children[0].code.as_string == '__stree_retval = callee(*((A, B) if flag else (B, A)), c=C)'
+    assert isinstance(stree.children[1], tn.ReturnNode)
+    assert stree.children[1].values[0].as_string == '__stree_retval'
+
+
+def test_python_frontend_schedule_tree_dynamic_expanded_sdfg_call_raises():
+
+    @dace.program
+    def inner(A: dace.float64[4], B: dace.float64[4]):
+        return A + B
+
+    sdfg_obj = inner.to_sdfg(simplify=False)
+
+    @dace.program
+    def dynamic_sdfg_call(flag: dace.bool_, A: dace.float64[4], B: dace.float64[4]):
+        return sdfg_obj(*((A, B) if flag else (B, A)))
+
+    with pytest.raises(DaceSyntaxError, match='Dynamic argument expansion is unsupported for SDFG calls'):
+        dynamic_sdfg_call.to_schedule_tree()
 
 
 # ------------------------------------------------------------------ #
@@ -1111,6 +1353,29 @@ def test_delete_noop_for_arrays():
     assert len(callbacks) == 0
 
 
+def test_dynamic_context_manager_produces_callback():
+
+    @contextlib.contextmanager
+    def guard(value):
+        if value > 0:
+            yield
+        else:
+            yield
+
+    @dace.program
+    def with_prog(A: dace.float64[10]):
+        with guard(A[0]):
+            A[1] = A[0]
+        return A
+
+    stree = with_prog.to_schedule_tree()
+
+    callbacks = [node for node in stree.preorder_traversal() if isinstance(node, tn.PythonCallbackNode)]
+    assert len(callbacks) == 1
+    assert callbacks[0].reason == 'context manager'
+    assert callbacks[0].code.as_string.startswith('with guard(A[0]):')
+
+
 def test_raise_produces_callback():
 
     @dace.program
@@ -1202,6 +1467,201 @@ def test_named_expr_desugared():
     # Should not crash — that's the main verification
 
 
+def test_singleton_subscript_assignment_scalarized():
+
+    @dace.program
+    def scalar_prog(x: dace.int32[20]):
+        idx = x[0]
+
+    stree = scalar_prog.to_schedule_tree()
+
+    assert [type(child) for child in stree.children] == [tn.TaskletNode]
+    assert stree.children[0].node.code.as_string == 'idx = x[0]'
+    assert str(stree.children[0].in_memlets['in0'].subset) == '0'
+    assert str(stree.children[0].out_memlets['out'].subset) == '0'
+    assert isinstance(stree.containers['idx'], dace.data.Scalar)
+
+
+def test_singleton_negative_subscript_assignment_canonicalized():
+    n = dace.symbol('n')
+
+    @dace.program
+    def scalar_prog(x: dace.int32[n]):
+        idx = x[-1]
+
+    stree = scalar_prog.to_schedule_tree()
+
+    assert [type(child) for child in stree.children] == [tn.TaskletNode]
+    assert stree.children[0].node.code.as_string == 'idx = x[(n - 1)]'
+    assert str(stree.children[0].in_memlets['in0'].subset) == 'n - 1'
+    assert str(stree.children[0].out_memlets['out'].subset) == '0'
+    assert isinstance(stree.containers['idx'], dace.data.Scalar)
+
+
+def test_singleton_symbolic_negative_subscript_assignment_canonicalized():
+    n = dace.symbol('n')
+    i = dace.symbol('i', integer=True, positive=True)
+
+    @dace.program
+    def scalar_prog(x: dace.int32[n]):
+        idx = x[-i]
+
+    stree = scalar_prog.to_schedule_tree()
+
+    assert [type(child) for child in stree.children] == [tn.TaskletNode]
+    assert stree.children[0].node.code.as_string == 'idx = x[(n - i)]'
+    assert (dace.symbolic.pystr_to_symbolic(str(
+        stree.children[0].in_memlets['in0'].subset)) == dace.symbolic.pystr_to_symbolic('n - i'))
+    assert str(stree.children[0].out_memlets['out'].subset) == '0'
+
+
+def test_short_circuit_condition_keeps_nested_index_in_guard():
+
+    @dace.program
+    def guard_prog(A: dace.int32[20], b: dace.int32[20], out: dace.int32[1], flag: dace.bool_, i: dace.int32):
+        if flag and A[b[i]] == 0:
+            out[0] = 1
+
+    stree = guard_prog.to_schedule_tree()
+
+    assert [type(child) for child in stree.children] == [tn.IfScope]
+    assert 'A[b[i]]' in stree.children[0].condition.as_string
+    assert '__stree_idx' not in stree.children[0].condition.as_string
+    assert isinstance(stree.children[0].children[0], tn.TaskletNode)
+
+
+def test_while_with_hoisted_index_rewritten_to_guarded_loop():
+
+    @dace.program
+    def loop_prog(A: dace.int32[20], b: dace.int32[20], i: dace.int32):
+        while A[b[i]] == 0:
+            i += 1
+
+    stree = loop_prog.to_schedule_tree()
+
+    assert [type(child) for child in stree.children] == [tn.LoopScope]
+    assert stree.children[0].loop.loop_condition.as_string == 'True'
+    assert isinstance(stree.children[0].children[0], tn.TaskletNode)
+    assert stree.children[0].children[0].node.code.as_string == '__stree_idx = b[i]'
+    assert isinstance(stree.children[0].children[1], tn.IfScope)
+    assert 'not (A[__stree_idx] == 0)' in stree.children[0].children[1].condition.as_string
+    assert isinstance(stree.children[0].children[1].children[0], tn.BreakNode)
+
+
+def test_while_else_with_hoisted_index_falls_back_to_callback():
+
+    @dace.program
+    def loop_prog(A: dace.int32[20], b: dace.int32[20], out: dace.int32[1], i: dace.int32):
+        while A[b[i]] == 0:
+            i += 1
+        else:
+            out[0] = 1
+
+    stree = loop_prog.to_schedule_tree()
+
+    callbacks = [node for node in stree.preorder_traversal() if isinstance(node, tn.PythonCallbackNode)]
+    assert len(callbacks) == 1
+    assert callbacks[0].reason == 'while loop test outlining with else'
+    assert callbacks[0].code.as_string.startswith('while (A[b[i]] == 0):')
+
+
+def test_while_else_without_hoisting_lowers_natively():
+
+    @dace.program
+    def loop_prog(A: dace.int32[20], out: dace.int32[1], i: dace.int32):
+        while i < 3:
+            i += 1
+        else:
+            out[0] = 1
+
+    stree = loop_prog.to_schedule_tree()
+
+    assert isinstance(stree.children[0], tn.LoopScope)
+    assert stree.children[0].loop.loop_condition.as_string == '(i < 3)'
+    assert isinstance(stree.children[1], tn.ElseScope)
+    assert isinstance(stree.children[1].children[0], tn.TaskletNode)
+
+
+def test_for_else_lowers_natively():
+
+    @dace.program
+    def loop_prog(A: dace.int32[20], out: dace.int32[1]):
+        for i in range(3):
+            A[i] = A[i]
+        else:
+            out[0] = 1
+
+    stree = loop_prog.to_schedule_tree()
+
+    assert isinstance(stree.children[0], tn.LoopScope)
+    assert stree.children[0].loop.loop_condition.as_string == '(i < 3)'
+    assert isinstance(stree.children[1], tn.ElseScope)
+    assert isinstance(stree.children[1].children[0], tn.TaskletNode)
+
+
+def test_schedule_tree_distinguishes_list_and_tuple_indices():
+
+    @dace.program
+    def list_prog(A: dace.float64[5, 6]):
+        tmp = A[[1, 2]]
+        return tmp
+
+    @dace.program
+    def tuple_prog(A: dace.float64[5, 6]):
+        tmp = A[(1, 2)]
+        return tmp
+
+    list_stree = list_prog.to_schedule_tree()
+    tuple_stree = tuple_prog.to_schedule_tree()
+
+    assert isinstance(list_stree.containers['tmp'], dace.data.Array)
+    assert tuple(list_stree.containers['tmp'].shape) == (2, 6)
+    assert isinstance(tuple_stree.containers['tmp'], dace.data.Scalar)
+    assert tuple(tuple_stree.containers['tmp'].shape) == (1, )
+    assert isinstance(list_stree.children[0], tn.TaskletNode)
+    assert str(list_stree.children[0].out_memlets['out'].subset) == '0:2, 0:6'
+    assert isinstance(tuple_stree.children[0], tn.TaskletNode)
+    assert str(tuple_stree.children[0].out_memlets['out'].subset) == '0'
+    assert not any(isinstance(node, tn.PythonCallbackNode) for node in list_stree.preorder_traversal())
+    assert not any(isinstance(node, tn.PythonCallbackNode) for node in tuple_stree.preorder_traversal())
+
+
+def test_schedule_tree_distinguishes_list_and_tuple_indices_with_symbolic_shape():
+    n = dace.symbol('n')
+
+    @dace.program
+    def list_prog(A: dace.float64[5, n]):
+        tmp = A[[1, 2]]
+        return tmp
+
+    @dace.program
+    def tuple_prog(A: dace.float64[5, n]):
+        tmp = A[(1, 2)]
+        return tmp
+
+    list_stree = list_prog.to_schedule_tree()
+    tuple_stree = tuple_prog.to_schedule_tree()
+
+    assert tuple(list_stree.containers['tmp'].shape) == (2, n)
+    assert str(list_stree.children[0].out_memlets['out'].subset) == '0:2, 0:n'
+    assert isinstance(tuple_stree.containers['tmp'], dace.data.Scalar)
+
+
+def test_schedule_tree_symbolic_static_slice_shape():
+    n = dace.symbol('n')
+
+    @dace.program
+    def slice_prog(A: dace.float64[n]):
+        tmp = A[1:n:2]
+        return tmp
+
+    stree = slice_prog.to_schedule_tree()
+
+    assert isinstance(stree.containers['tmp'], dace.data.Array)
+    assert str(stree.containers['tmp'].shape[0]) == 'ceiling(n/2 - 1/2)'
+    assert isinstance(stree.children[0], tn.ViewNode)
+
+
 def test_comprehension_desugaring():
     """Comprehensions should be desugared to explicit loops."""
 
@@ -1290,7 +1750,8 @@ def test_comprehensive_coverage():
         'With',
         'AsyncWith',  # ContextManagerInliner
         'Assert',  # Removed/evaluated
-        'AsyncFor',  # Treated as For
+        'AsyncFor',  # Disallowed
+        'TypeAlias',  # TypeAliasResolver
     }
 
     # All explicitly handled types
@@ -1305,12 +1766,67 @@ def test_comprehensive_coverage():
         expected_unhandled.add('Match')
     if sys.version_info < (3, 11):
         expected_unhandled.add('TryStar')
-    if sys.version_info >= (3, 12):
-        # TypeAlias is a statement in 3.12+
-        expected_unhandled.add('TypeAlias')
-
     actual_unhandled = unhandled - expected_unhandled
     assert not actual_unhandled, f'Unhandled AST statement types: {actual_unhandled}'
+
+
+def test_type_alias_is_compile_time_only_in_schedule_tree(temp_python_module):
+    if sys.version_info < (3, 12):
+        pytest.skip('Type alias statements require Python 3.12+')
+
+    with temp_python_module('''
+import dace
+
+@dace.program
+def prog(A: dace.float32[4]):
+    type dtype = dace.float32[4]
+    tmp: dtype = A
+    return tmp
+''',
+                            module_name_prefix='dace_schedule_tree_typealias') as module:
+        stree = module.prog.to_schedule_tree()
+
+    assert 'tmp' in stree.containers
+    assert isinstance(stree.containers['tmp'], dace.data.Array)
+    assert stree.containers['tmp'].dtype == dace.float32
+    assert tuple(stree.containers['tmp'].shape) == (4, )
+    assert not any(
+        isinstance(node, tn.PythonCallbackNode) and node.reason == 'unhandled TypeAlias'
+        for node in stree.preorder_traversal())
+
+
+def test_generic_type_alias_is_rejected_in_schedule_tree(temp_python_module):
+    if sys.version_info < (3, 12):
+        pytest.skip('Type alias statements require Python 3.12+')
+
+    with temp_python_module('''
+import dace
+
+@dace.program
+def prog(A: dace.float32[4]):
+    type dtype[T] = T
+    return A
+''',
+                            module_name_prefix='dace_schedule_tree_typealias') as module:
+        with pytest.raises(DaceSyntaxError, match='Generic type aliases'):
+            module.prog.to_schedule_tree()
+
+
+def test_type_var_tuple_alias_is_rejected_in_schedule_tree(temp_python_module):
+    if sys.version_info < (3, 12):
+        pytest.skip('Type alias statements require Python 3.12+')
+
+    with temp_python_module('''
+import dace
+
+@dace.program
+def prog(A: dace.float32[4]):
+    type dtype[*Ts] = tuple[*Ts]
+    return A
+''',
+                            module_name_prefix='dace_schedule_tree_typealias') as module:
+        with pytest.raises(DaceSyntaxError, match='Generic type aliases'):
+            module.prog.to_schedule_tree()
 
 
 if __name__ == '__main__':
