@@ -1,4 +1,4 @@
-# Copyright 2019-2024 ETH Zurich and the DaCe authors. All rights reserved.
+# Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 import copy
 from collections import defaultdict
 from dace import symbolic
@@ -10,7 +10,7 @@ from dace.sdfg.state import ConditionalBlock, ControlFlowBlock, SDFGState
 from dace.sdfg.analysis.schedule_tree import treenodes as tn
 from dace.sdfg import propagation
 from enum import Enum, auto
-from typing import Dict, Final, List, Optional, Set, Tuple
+from typing import Final
 
 
 class StateBoundaryBehavior(Enum):
@@ -25,7 +25,7 @@ MAX_NESTED_SDFGS: Final[int] = 1000
 
 class StreeToSDFG(tn.ScheduleNodeVisitor):
 
-    def __init__(self, start_state: Optional[SDFGState] = None) -> None:
+    def __init__(self, start_state: SDFGState | None = None) -> None:
         self._ctx: tn.Context
         """Context information like tree root and current scope."""
 
@@ -35,25 +35,25 @@ class StreeToSDFG(tn.ScheduleNodeVisitor):
         self._current_nestedSDFG: int | None = None
         """Id of the current nested SDFG if we are inside one."""
 
-        self._interstate_symbols: List[tn.AssignNode] = []
+        self._interstate_symbols: list[tn.AssignNode] = []
         """Interstate symbol assignments. Will be assigned with the next state transition."""
 
-        self._nviews_free: List[tn.NView] = []
+        self._nviews_free: list[tn.NView] = []
         """Keep track of NView (nested SDFG view) nodes that are "free" to be used."""
 
-        self._nviews_bound_per_scope: Dict[int, List[tn.NView]] = {}
+        self._nviews_bound_per_scope: dict[int, list[tn.NView]] = {}
         """Mapping of id(SDFG) -> list of active NView nodes in that SDFG."""
 
-        self._nviews_deferred_removal: Dict[int, List[tn.NView]] = {}
+        self._nviews_deferred_removal: dict[int, list[tn.NView]] = {}
         """"Mapping of id(SDFG) -> list of NView nodes to be removed once we exit this nested SDFG."""
 
         # state management
-        self._state_stack: List[SDFGState] = []
+        self._state_stack: list[SDFGState] = []
 
         # dataflow scopes
-        # List[ (MapEntryNode, ToConnect) | (SDFG, {"inputs": set(), "outputs": set()}) ]
-        self._dataflow_stack: List[Tuple[nodes.EntryNode, Dict[str, Tuple[nodes.AccessNode, Memlet]]]
-                                   | Tuple[SDFG, Dict[str, Set[str]]]] = []
+        # list[ (MapEntryNode, ToConnect) | (SDFG, {"inputs": set(), "outputs": set()}) ]
+        self._dataflow_stack: list[tuple[nodes.EntryNode, dict[str, tuple[nodes.AccessNode, Memlet]]]
+                                   | tuple[SDFG, dict[str, set[str]]]] = []
 
     def _apply_nview_array_override(self, array_name: str, sdfg: SDFG) -> bool:
         """Apply an NView override if applicable. Returns true if the NView was applied."""
@@ -85,7 +85,7 @@ class StreeToSDFG(tn.ScheduleNodeVisitor):
         assert sdfg_counter < MAX_NESTED_SDFGS, f"Array '{name}' not found in any parent of SDFG '{sdfg.name}'."
         return parent_sdfg
 
-    def _pop_state(self, label: Optional[str] = None) -> SDFGState:
+    def _pop_state(self, label: str | None = None) -> SDFGState:
         """Pops the last state from the state stack.
 
         :param str, optional label: Ensures the popped state's label starts with the given string.
@@ -265,7 +265,7 @@ class StreeToSDFG(tn.ScheduleNodeVisitor):
         raise NotImplementedError(f"Support for {type(node)} not yet implemented.")
 
     def visit_ElseScope(self, node: tn.ElseScope, sdfg: SDFG) -> None:
-        # get ConditionalBlock form stack
+        # get ConditionalBlock from stack
         conditional_block: ConditionalBlock = self._pop_state("if_scope")
 
         else_body = ControlFlowRegion("else_body", sdfg=sdfg)
@@ -284,7 +284,7 @@ class StreeToSDFG(tn.ScheduleNodeVisitor):
         if self._pending_interstate_assignments():
             raise NotImplementedError("TODO: update edge with new assignments")
 
-    def _insert_nestedSDFG(self, node: tn.MapScope, sdfg: SDFG) -> None:
+    def _insert_nestedSDFG_in_MapScope(self, node: tn.MapScope, sdfg: SDFG) -> None:
         dataflow_stack_size = len(self._dataflow_stack)
         state_stack_size = len(self._state_stack)
         outer_nestedSDFG = self._current_nestedSDFG
@@ -396,7 +396,7 @@ class StreeToSDFG(tn.ScheduleNodeVisitor):
             with node.scope(self._current_state, self._ctx):
                 self.visit(node.children[-1], sdfg=sdfg)
         elif any([isinstance(child, tn.StateBoundaryNode) for child in node.children]):
-            self._insert_nestedSDFG(node, sdfg)
+            self._insert_nestedSDFG_in_MapScope(node, sdfg)
         else:
             with node.scope(self._current_state, self._ctx):
                 self.visit(node.children, sdfg=sdfg)
@@ -734,7 +734,7 @@ class StreeToSDFG(tn.ScheduleNodeVisitor):
             assignments=pending,
         )
 
-    def _pending_interstate_assignments(self) -> Dict:
+    def _pending_interstate_assignments(self) -> dict[str, str]:
         """
         Return currently pending interstate assignments. Clears the cache.
         """
@@ -853,10 +853,10 @@ def _insert_memory_dependency_state_boundaries(scope: tn.ScheduleTreeScope):
     """
     Helper function that inserts boundaries after unmet memory dependencies.
     """
-    reads: mmu.MemletDict[List[tn.ScheduleTreeNode]] = mmu.MemletDict()
-    writes: mmu.MemletDict[List[tn.ScheduleTreeNode]] = mmu.MemletDict()
-    parents: Dict[int, Set[int]] = defaultdict(set)
-    boundaries_to_insert: List[int] = []
+    reads: mmu.MemletDict[list[tn.ScheduleTreeNode]] = mmu.MemletDict()
+    writes: mmu.MemletDict[list[tn.ScheduleTreeNode]] = mmu.MemletDict()
+    parents: dict[int, set[int]] = defaultdict(set)
+    boundaries_to_insert: list[int] = []
 
     for i, n in enumerate(scope.children):
         if isinstance(n, (tn.StateBoundaryNode, tn.ControlFlowScope)):  # Clear state
@@ -932,7 +932,7 @@ def create_state_boundary(
     boundary_node: tn.StateBoundaryNode,
     state: SDFGState,
     behavior: StateBoundaryBehavior,
-    assignments: Optional[Dict] = None,
+    assignments: dict[str, str] | None = None,
 ) -> SDFGState:
     """
     Creates a boundary between two states
@@ -943,10 +943,10 @@ def create_state_boundary(
     :return: The newly created state.
     """
     if behavior != StateBoundaryBehavior.STATE_TRANSITION:
-        raise NotImplementedError("Only STATE_TRANSITION is supported as StateBoundaryBehavior in this prototype.")
+        raise NotImplementedError("Only STATE_TRANSITION is currently supported as StateBoundaryBehavior.")
 
-    # TODO: Some boundaries (control flow, state labels with goto) could not be fulfilled with every
-    #       behavior. Fall back to state transition in that case.
+    # TODO: Some boundaries (control flow, state labels with goto, pending assignments) could not be fulfilled
+    #       with every behavior. Fall back to state transition in that case.
 
     label = "cf_state_boundary" if boundary_node.due_to_control_flow else "state_boundary"
     assignments = assignments if assignments is not None else {}
@@ -955,10 +955,10 @@ def create_state_boundary(
 
 def _insert_and_split_assignments(
     before_state: ControlFlowBlock,
-    after_state: Optional[ControlFlowBlock] = None,
+    after_state: ControlFlowBlock | None = None,
     *,
-    label: Optional[str] = None,
-    assignments: Optional[Dict] = None,
+    label: str | None = None,
+    assignments: dict[str, str] | None = None,
 ) -> ControlFlowBlock:
     """
     Insert given assignments splitting them in case of potential race conditions.
@@ -1006,7 +1006,7 @@ def _insert_and_split_assignments(
     return last_state
 
 
-def _list_index(list: List[tn.ScheduleTreeNode], node: tn.ScheduleTreeNode) -> int:
+def _list_index(list: list[tn.ScheduleTreeNode], node: tn.ScheduleTreeNode) -> int:
     """Check if node is in list with "is" operator."""
     index = 0
     for element in list:

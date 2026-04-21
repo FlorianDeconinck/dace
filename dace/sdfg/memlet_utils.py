@@ -1,6 +1,4 @@
-# Copyright 2019-2024 ETH Zurich and the DaCe authors. All rights reserved.
-from __future__ import annotations
-
+# Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 import ast
 from collections import defaultdict
 import copy
@@ -176,7 +174,7 @@ class MemletSet(Set[Memlet]):
 
         return False
 
-    def union(self, *s: Iterable[Memlet]) -> MemletSet:
+    def union(self, *s: Iterable[Memlet]) -> 'MemletSet':
         """
         Performs a set-union (with memlet union) over the given sets of memlets.
 
