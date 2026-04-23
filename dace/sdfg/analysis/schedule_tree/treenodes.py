@@ -10,8 +10,7 @@ from dace.sdfg.propagation import propagate_subset
 from dace.sdfg.sdfg import InterstateEdge, SDFG, memlets_in_ast
 from dace.sdfg.state import LoopRegion, SDFGState
 from dace.memlet import Memlet
-from types import TracebackType
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Literal, Optional, Set, Tuple, Union, Sequence
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Literal, Optional, Tuple, Union, Sequence
 
 if TYPE_CHECKING:
     from dace import SDFG
@@ -94,46 +93,8 @@ class FrontendFunctionCall:
 
 
 @dataclass
-class Context:
-    root: 'ScheduleTreeRoot'
-    current_scope: Optional['ScheduleTreeScope']
-
-    access_cache: dict[tuple[SDFGState, str], dict[str, nodes.AccessNode]]
-    """Per scope (hashed by id(scope_node) access_cache."""
-
-
-class ContextPushPop:
-    """Append the given node to the scope, then push/pop the scope."""
-
-    def __init__(self, ctx: Context, state: SDFGState, node: 'ScheduleTreeScope') -> None:
-        if ctx.current_scope is None and not isinstance(node, ScheduleTreeRoot):
-            raise ValueError("ctx.current_scope is only allowed to be 'None' when node it tree root.")
-
-        self._ctx = ctx
-        self._parent_scope = ctx.current_scope
-        self._node = node
-        self._state = state
-
-        cache_key = (state, id(node))
-        assert cache_key not in self._ctx.access_cache
-        self._ctx.access_cache[cache_key] = {}
-
-    def __enter__(self) -> None:
-        assert not self._ctx.access_cache[(self._state, id(
-            self._node))], "Expecting an empty access_cache when entering the context."
-
-        self._ctx.current_scope = self._node
-
-    def __exit__(self, exc_type: type[BaseException] | None, exc_val: BaseException | None,
-                 exc_tb: TracebackType | None) -> None:
-        cache_key = (self._state, id(self._node))
-        assert cache_key in self._ctx.access_cache
-
-        self._ctx.current_scope = self._parent_scope
-
-
-@dataclass
 class ScheduleTreeNode:
+    """Base class for nodes in the schedule tree."""
     parent: Optional['ScheduleTreeScope'] = field(default=None, init=False, repr=False)
 
     def as_string(self, indent: int = 0):
@@ -173,6 +134,11 @@ class ScheduleTreeNode:
 
 @dataclass
 class ScheduleTreeScope(ScheduleTreeNode):
+    """
+    A `ScheduleTreeScope` is the base class for grouping `ScheduleTreeNode`s hierarchically.
+
+    Each scope holds a list of children and a reference to the parent.
+    """
     children: list[ScheduleTreeNode]
 
     def __init__(self, *, children: list[ScheduleTreeNode], parent: Optional['ScheduleTreeScope'] = None) -> None:
@@ -302,8 +268,11 @@ class ScheduleTreeScope(ScheduleTreeNode):
 @dataclass
 class ScheduleTreeRoot(ScheduleTreeScope):
     """
-    A root of an SDFG schedule tree. This is a schedule tree scope with additional information on
+    The root of a schedule tree. This is a `ScheduleTreeScope` with additional information on
     the available descriptors, symbol types, and constants of the tree, aka the descriptor repository.
+
+    Each schedule tree has only one `ScheduleTreeRoot`. The `ScheduleTreeRoot` is the only `ScheduleTreeScope`
+    without a parent (because it is the root node of the tree).
     """
     name: str
     containers: dict[str, data.Data]
@@ -366,9 +335,6 @@ class ScheduleTreeRoot(ScheduleTreeScope):
     def get_root(self) -> 'ScheduleTreeRoot':
         return self
 
-    def scope(self, state: SDFGState, ctx: Context) -> ContextPushPop:
-        return ContextPushPop(ctx, state, self)
-
 
 @dataclass
 class ControlFlowScope(ScheduleTreeScope):
@@ -425,9 +391,6 @@ class DataflowScope(ScheduleTreeScope):
 
         self.node = node
         self.state = state
-
-    def scope(self, state: SDFGState, ctx: Context) -> ContextPushPop:
-        return ContextPushPop(ctx, state, self)
 
 
 @dataclass

@@ -1,16 +1,19 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 import copy
+
 from collections import defaultdict
+from dataclasses import dataclass
+from enum import Enum, auto
+from types import TracebackType
+from typing import Final
+
 from dace import symbolic
-from dace.dtypes import DebugInfo
 from dace.memlet import Memlet
 from dace.sdfg import nodes, memlet_utils as mmu
 from dace.sdfg.sdfg import SDFG, ControlFlowRegion, InterstateEdge
 from dace.sdfg.state import ConditionalBlock, ControlFlowBlock, SDFGState
 from dace.sdfg.analysis.schedule_tree import treenodes as tn
 from dace.sdfg import propagation
-from enum import Enum, auto
-from typing import Final
 
 
 class StateBoundaryBehavior(Enum):
@@ -20,12 +23,61 @@ class StateBoundaryBehavior(Enum):
 
 PREFIX_PASSTHROUGH_IN: Final[str] = "IN_"
 PREFIX_PASSTHROUGH_OUT: Final[str] = "OUT_"
-MAX_NESTED_SDFGS: Final[int] = 1000
 
 
-class StreeToSDFG(tn.ScheduleNodeVisitor):
+@dataclass
+class _Context:
+    """Context information for transforming a schedule tree into an SDFG."""
 
-    def __init__(self, start_state: SDFGState | None = None) -> None:
+    root: tn.ScheduleTreeRoot
+    current_scope: tn.ScheduleTreeScope | None
+
+    access_cache: dict[tuple[SDFGState, str], dict[str, nodes.AccessNode]]
+    """Per scope (hashed by id(scope_node) access_cache."""
+
+
+class _TreeScope:
+    """Automatically set the current scope on the context to the given node."""
+
+    def __init__(self, node: tn.ScheduleTreeScope, ctx: _Context, state: SDFGState) -> None:
+        if ctx.current_scope is None and not isinstance(node, tn.ScheduleTreeRoot):
+            raise ValueError("ctx.current_scope is only allowed to be 'None' when node it tree root.")
+
+        self._ctx = ctx
+        self._parent_scope = ctx.current_scope
+        self._node = node
+        self._state = state
+
+        cache_key = (state, id(node))
+        assert cache_key not in self._ctx.access_cache
+        self._ctx.access_cache[cache_key] = {}
+
+    def __enter__(self) -> None:
+        assert not self._ctx.access_cache[(self._state, id(
+            self._node))], "Expecting an empty access_cache when entering the context."
+
+        self._ctx.current_scope = self._node
+
+    def __exit__(self, exc_type: type[BaseException] | None, exc_val: BaseException | None,
+                 exc_tb: TracebackType | None) -> None:
+        cache_key = (self._state, id(self._node))
+        assert cache_key in self._ctx.access_cache
+
+        self._ctx.current_scope = self._parent_scope
+
+
+class _StreeToSDFG(tn.ScheduleNodeVisitor):
+
+    def __init__(
+        self,
+        start_state: SDFGState | None = None,
+        *,
+        boundary_behavior: StateBoundaryBehavior = StateBoundaryBehavior.STATE_TRANSITION,
+        max_nested_sdfg: int = 1000,
+    ) -> None:
+        if boundary_behavior != StateBoundaryBehavior.STATE_TRANSITION:
+            raise NotImplementedError("Only STATE_TRANSITION is currently supported as StateBoundaryBehavior.")
+
         self._ctx: tn.Context
         """Context information like tree root and current scope."""
 
@@ -55,8 +107,14 @@ class StreeToSDFG(tn.ScheduleNodeVisitor):
         self._dataflow_stack: list[tuple[nodes.EntryNode, dict[str, tuple[nodes.AccessNode, Memlet]]]
                                    | tuple[SDFG, dict[str, set[str]]]] = []
 
+        self._max_nested_sdfg = max_nested_sdfg
+
     def _apply_nview_array_override(self, array_name: str, sdfg: SDFG) -> bool:
-        """Apply an NView override if applicable. Returns true if the NView was applied."""
+        """
+        Apply an NView override if applicable. Returns true if the NView was applied.
+
+        See `visit_NView()` for how we keep track of nested SDFG view nodes.
+        """
         length = len(self._nviews_free)
         for index, nview in enumerate(reversed(self._nviews_free), start=1):
             if nview.target == array_name and nview not in self._nviews_deferred_removal[id(sdfg)]:
@@ -78,11 +136,11 @@ class StreeToSDFG(tn.ScheduleNodeVisitor):
         """Find the closest parent SDFG containing an array with the given name."""
         parent_sdfg = sdfg.parent.parent
         sdfg_counter = 1
-        while name not in parent_sdfg.arrays and sdfg_counter < MAX_NESTED_SDFGS:
+        while name not in parent_sdfg.arrays and sdfg_counter < self._max_nested_sdfgs:
             parent_sdfg = parent_sdfg.parent.parent
             assert isinstance(parent_sdfg, SDFG)
             sdfg_counter += 1
-        assert sdfg_counter < MAX_NESTED_SDFGS, f"Array '{name}' not found in any parent of SDFG '{sdfg.name}'."
+        assert sdfg_counter < self._max_nested_sdfgs, f"Array '{name}' not found in any parent of SDFG '{sdfg.name}'."
         return parent_sdfg
 
     def _pop_state(self, label: str | None = None) -> SDFGState:
@@ -108,8 +166,8 @@ class StreeToSDFG(tn.ScheduleNodeVisitor):
         assert not self._interstate_symbols, "Expected empty list of symbols at root."
 
         self._current_state = sdfg.add_state(label="tree_root", is_start_block=True)
-        self._ctx = tn.Context(root=node, access_cache={}, current_scope=None)
-        with node.scope(self._current_state, self._ctx):
+        self._ctx = _Context(root=node, access_cache={}, current_scope=None)
+        with _TreeScope(node, self._ctx, self._current_state):
             self.visit(node.children, sdfg=sdfg)
 
         assert not self._state_stack, "Expected empty state stack."
@@ -153,11 +211,6 @@ class StreeToSDFG(tn.ScheduleNodeVisitor):
                             # Transients passed into a nested SDFG become non-transient inside that nested SDFG
                             if parent_sdfg.arrays[memlet.data].transient:
                                 sdfg.arrays[memlet.data].transient = False
-                                # TODO
-                                # ... unless they are only ever used inside the nested SDFG, in which case
-                                # we should delete them from the parent SDFG's array list.
-                                # NOTE This can probably be done automatically by a cleanup pass in the end.
-                                #      Something like DDE should be able to do this.
 
                         # Dev note: nview.target and memlet.data are identical
                         assert memlet.data not in to_connect["inputs"]
@@ -303,7 +356,7 @@ class StreeToSDFG(tn.ScheduleNodeVisitor):
         self._current_state = start_state
 
         # visit children
-        with node.scope(self._current_state, self._ctx):
+        with _TreeScope(node, self._ctx, self._current_state):
             self.visit(node.children, sdfg=inner_sdfg)
 
         # restore current state and stacks
@@ -317,7 +370,6 @@ class StreeToSDFG(tn.ScheduleNodeVisitor):
             sdfg=inner_sdfg,
             inputs=connectors["inputs"],
             outputs=connectors["outputs"],
-            debuginfo=DebugInfo(123456),  # fake DebugInfo to avoid calls to `inspect`
         )
         # connect nested SDFG to surrounding map scope
         assert self._dataflow_stack
@@ -393,12 +445,12 @@ class StreeToSDFG(tn.ScheduleNodeVisitor):
         if last_child_is_MapScope and all_others_are_Boundaries:
             # skip weirdly added StateBoundaryNode
             # tmp: use this - for now - to "backprop-insert" extra state boundaries for nested SDFGs
-            with node.scope(self._current_state, self._ctx):
+            with _TreeScope(node, self._ctx, self._current_state):
                 self.visit(node.children[-1], sdfg=sdfg)
         elif any([isinstance(child, tn.StateBoundaryNode) for child in node.children]):
             self._insert_nestedSDFG_in_MapScope(node, sdfg)
         else:
-            with node.scope(self._current_state, self._ctx):
+            with _TreeScope(node, self._ctx, self._current_state):
                 self.visit(node.children, sdfg=sdfg)
 
         cache_key = (cache_state, id(self._ctx.current_scope))
@@ -450,11 +502,6 @@ class StreeToSDFG(tn.ScheduleNodeVisitor):
                             # Transients passed into a nested SDFG become non-transient inside that nested SDFG
                             if parent_sdfg.arrays[memlet_data].transient:
                                 sdfg.arrays[memlet_data].transient = False
-                                # TODO
-                                # ... unless they are only ever used inside the nested SDFG, in which case
-                                # we should delete them from the parent SDFG's array list.
-                                # NOTE This can probably be done automatically by a cleanup pass in the end.
-                                #      Something like DDE should be able to do this.
 
                         # Dev note: nview.target and memlet_data are identical
                         assert memlet_data not in outer_to_connect["inputs"]
@@ -464,8 +511,7 @@ class StreeToSDFG(tn.ScheduleNodeVisitor):
 
                 # cache local read access
                 assert memlet_data not in access_cache
-                # fake DebugInfo to avoid calls to `inspect`
-                access_cache[memlet_data] = self._current_state.add_read(memlet_data, DebugInfo(123456))
+                access_cache[memlet_data] = self._current_state.add_read(memlet_data)
                 cached_access = access_cache[memlet_data]
                 self._current_state.add_memlet_path(cached_access,
                                                     map_entry,
@@ -533,8 +579,8 @@ class StreeToSDFG(tn.ScheduleNodeVisitor):
             # map i=0:20:
             #  A[i] = tasklet(A[i])
             if name not in access_cache or self._current_state.out_degree(access_cache[name]) > 0:
-                # cache write access into access_cache (with fake DebugInfo to avoid calls to `inspect`)
-                write_access_node = self._current_state.add_write(name, DebugInfo(123456))
+                # cache write access into access_cache
+                write_access_node = self._current_state.add_write(name)
                 access_cache[name] = write_access_node
 
             access_node = access_cache[name]
@@ -600,11 +646,6 @@ class StreeToSDFG(tn.ScheduleNodeVisitor):
                         # Transients passed into a nested SDFG become non-transient inside that nested SDFG
                         if parent_sdfg.arrays[memlet.data].transient:
                             sdfg.arrays[memlet.data].transient = False
-                            # TODO
-                            # ... unless they are only ever used inside the nested SDFG, in which case
-                            # we should delete them from the parent SDFG's array list.
-                            # NOTE This can probably be done automatically by a cleanup pass in the end.
-                            #      Something like DDE should be able to do this.
 
                     # Dev note: memlet.data and nview.target are identical
                     assert memlet.data not in to_connect["inputs"]
@@ -614,8 +655,7 @@ class StreeToSDFG(tn.ScheduleNodeVisitor):
 
             # cache local read access
             assert memlet.data not in cache
-            cache[memlet.data] = self._current_state.add_read(
-                memlet.data, DebugInfo(123456))  # fake DebugInfo to avoid calls to `inspect`
+            cache[memlet.data] = self._current_state.add_read(memlet.data)
             cached_access = cache[memlet.data]
             self._current_state.add_memlet_path(cached_access, tasklet, dst_conn=name, memlet=memlet)
 
@@ -629,8 +669,7 @@ class StreeToSDFG(tn.ScheduleNodeVisitor):
             # A[1] = tasklet(A[1])
             if memlet.data not in cache or self._current_state.out_degree(cache[memlet.data]) > 0:
                 # cache write access node
-                write_access_node = self._current_state.add_write(
-                    memlet.data, DebugInfo(123456))  # fake DebugInfo to avoid calls to `inspect`
+                write_access_node = self._current_state.add_write(memlet.data)
                 cache[memlet.data] = write_access_node
 
             access_node = cache[memlet.data]
@@ -673,15 +712,11 @@ class StreeToSDFG(tn.ScheduleNodeVisitor):
 
         # assumption source access may or may not yet exist (in this state)
         src_name = node.memlet.data
-        source = access_cache[src_name] if src_name in access_cache else self._current_state.add_read(
-            src_name,
-            DebugInfo(123456),  # fake DebugInfo to avoid calls to `inspect`
-        )
+        source = access_cache[src_name] if src_name in access_cache else self._current_state.add_read(src_name)
 
         # assumption: target access node doesn't exist yet
         assert node.target not in access_cache
-        target = self._current_state.add_write(node.target,
-                                               DebugInfo(123456))  # fake DebugInfo to avoid calls to `inspect`
+        target = self._current_state.add_write(node.target)
 
         self._current_state.add_memlet_path(source, target, memlet=node.memlet)
 
@@ -727,10 +762,9 @@ class StreeToSDFG(tn.ScheduleNodeVisitor):
         # When creating a state boundary, include all inter-state assignments that precede it.
         pending = self._pending_interstate_assignments()
 
-        self._current_state = create_state_boundary(
+        self._current_state = _create_state_boundary(
             node,
             self._current_state,
-            StateBoundaryBehavior.STATE_TRANSITION,
             assignments=pending,
         )
 
@@ -747,8 +781,11 @@ class StreeToSDFG(tn.ScheduleNodeVisitor):
         return assignments
 
 
-def from_schedule_tree(stree: tn.ScheduleTreeRoot,
-                       state_boundary_behavior: StateBoundaryBehavior = StateBoundaryBehavior.STATE_TRANSITION) -> SDFG:
+def from_schedule_tree(
+    stree: tn.ScheduleTreeRoot,
+    state_boundary_behavior: StateBoundaryBehavior = StateBoundaryBehavior.STATE_TRANSITION,
+    max_nested_sdfgs: int = 1000,
+) -> SDFG:
     """
     Converts a schedule tree into an SDFG.
 
@@ -766,16 +803,16 @@ def from_schedule_tree(stree: tn.ScheduleTreeRoot,
     result.symbols = copy.deepcopy(stree.symbols)
 
     # Insert artificial state boundaries after WAW, before label, etc.
-    stree = insert_state_boundaries_to_tree(stree)
+    stree = _insert_state_boundaries_to_tree(stree)
 
     # Traverse tree and incrementally build SDFG, finally propagate memlets
-    StreeToSDFG().visit(stree, sdfg=result)
+    _StreeToSDFG(state_boundary_behavior, max_nested_sdfg=max_nested_sdfgs).visit(stree, sdfg=result)
     propagation.propagate_memlets_sdfg(result)
 
     return result
 
 
-def insert_state_boundaries_to_tree(stree: tn.ScheduleTreeRoot) -> tn.ScheduleTreeRoot:
+def _insert_state_boundaries_to_tree(stree: tn.ScheduleTreeRoot) -> tn.ScheduleTreeRoot:
     """
     Inserts StateBoundaryNode objects into a schedule tree where more than one SDFG state would be necessary.
     Operates in-place on the given schedule tree.
@@ -928,10 +965,9 @@ def _insert_memory_dependency_state_boundaries(scope: tn.ScheduleTreeScope):
 # SDFG content creation functions
 
 
-def create_state_boundary(
+def _create_state_boundary(
     boundary_node: tn.StateBoundaryNode,
     state: SDFGState,
-    behavior: StateBoundaryBehavior,
     assignments: dict[str, str] | None = None,
 ) -> SDFGState:
     """
@@ -939,15 +975,8 @@ def create_state_boundary(
 
     :param boundary_node: The state boundary node to generate.
     :param state: The last state prior to this boundary.
-    :param behavior: The state boundary behavior with which to create the boundary.
     :return: The newly created state.
     """
-    if behavior != StateBoundaryBehavior.STATE_TRANSITION:
-        raise NotImplementedError("Only STATE_TRANSITION is currently supported as StateBoundaryBehavior.")
-
-    # TODO: Some boundaries (control flow, state labels with goto, pending assignments) could not be fulfilled
-    #       with every behavior. Fall back to state transition in that case.
-
     label = "cf_state_boundary" if boundary_node.due_to_control_flow else "state_boundary"
     assignments = assignments if assignments is not None else {}
     return _insert_and_split_assignments(state, label=label, assignments=assignments)
@@ -963,15 +992,11 @@ def _insert_and_split_assignments(
     """
     Insert given assignments splitting them in case of potential race conditions.
 
-    DaCe validation (currently) won't let us add multiple assignment with read after
-    write pattern on the same edge. We thus split them over multiple state transitions
-    (inserting empty states in between) to be safe.
+    The semantics of the SDFG dictates that we can not assume any order in the application
+    of inter-state edge assignments. The only order is that conditions precede assignments.
 
-    NOTE (later) This should be double-checked since python dictionaries preserve
-                 insertion order since python 3.7 (which we rely on in this function
-                 too). Depending on code generation it could(TM) be that we can
-                 weaken (best case remove) the corresponding check from the sdfg
-                 validator.
+    Since we just collect all inter-state assignments while parsing the schedule tree, we
+    need to make sure to split problematic assignments over multiple state transitions.
     """
     assignments = assignments if assignments is not None else {}
     cf_region = before_state.parent_graph

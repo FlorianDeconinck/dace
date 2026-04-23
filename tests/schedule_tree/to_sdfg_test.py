@@ -27,7 +27,7 @@ def test_state_boundaries_none():
         ],
     )
 
-    stree = t2s.insert_state_boundaries_to_tree(stree)
+    stree = t2s._insert_state_boundaries_to_tree(stree)
     assert tn.StateBoundaryNode not in [type(n) for n in stree.children]
 
 
@@ -44,7 +44,7 @@ def test_state_boundaries_waw():
         ],
     )
 
-    stree = t2s.insert_state_boundaries_to_tree(stree)
+    stree = t2s._insert_state_boundaries_to_tree(stree)
     assert [tn.TaskletNode, tn.StateBoundaryNode, tn.TaskletNode] == [type(n) for n in stree.children]
 
 
@@ -65,7 +65,7 @@ def test_state_boundaries_waw_ranges(overlap):
         ],
     )
 
-    stree = t2s.insert_state_boundaries_to_tree(stree)
+    stree = t2s._insert_state_boundaries_to_tree(stree)
     if overlap:
         assert [tn.TaskletNode, tn.StateBoundaryNode, tn.TaskletNode] == [type(n) for n in stree.children]
     else:
@@ -87,7 +87,7 @@ def test_state_boundaries_war():
         ],
     )
 
-    stree = t2s.insert_state_boundaries_to_tree(stree)
+    stree = t2s._insert_state_boundaries_to_tree(stree)
     assert [tn.TaskletNode, tn.StateBoundaryNode, tn.TaskletNode] == [type(n) for n in stree.children]
 
 
@@ -109,7 +109,7 @@ def test_state_boundaries_read_write_chain():
         ],
     )
 
-    stree = t2s.insert_state_boundaries_to_tree(stree)
+    stree = t2s._insert_state_boundaries_to_tree(stree)
     assert [tn.TaskletNode, tn.TaskletNode, tn.TaskletNode] == [type(n) for n in stree.children]
 
 
@@ -133,7 +133,7 @@ def test_state_boundaries_data_race():
         ],
     )
 
-    stree = t2s.insert_state_boundaries_to_tree(stree)
+    stree = t2s._insert_state_boundaries_to_tree(stree)
     assert [tn.TaskletNode, tn.TaskletNode, tn.StateBoundaryNode, tn.TaskletNode,
             tn.TaskletNode] == [type(n) for n in stree.children]
 
@@ -159,7 +159,7 @@ def test_state_boundaries_cfg():
         ],
     )
 
-    stree = t2s.insert_state_boundaries_to_tree(stree)
+    stree = t2s._insert_state_boundaries_to_tree(stree)
     assert [tn.TaskletNode, tn.StateBoundaryNode, tn.ForScope] == [type(n) for n in stree.children]
 
 
@@ -181,7 +181,7 @@ def test_state_boundaries_state_transition():
         ],
     )
 
-    stree = t2s.insert_state_boundaries_to_tree(stree)
+    stree = t2s._insert_state_boundaries_to_tree(stree)
     assert [
         tn.AssignNode, tn.StateBoundaryNode, tn.TaskletNode, tn.StateBoundaryNode, tn.AssignNode, tn.StateBoundaryNode
     ] == [type(n) for n in stree.children]
@@ -210,7 +210,7 @@ def test_state_boundaries_propagation(boundary):
         ],
     )
 
-    stree = t2s.insert_state_boundaries_to_tree(stree)
+    stree = t2s._insert_state_boundaries_to_tree(stree)
 
     node_types = [type(n) for n in stree.preorder_traversal()]
     if boundary:
@@ -220,24 +220,19 @@ def test_state_boundaries_propagation(boundary):
 
 
 @pytest.mark.parametrize("control_flow", (True, False))
-def test_create_state_boundary_state_transition(control_flow):
+def test_create_state_boundary_state_transition(control_flow: bool):
     sdfg = dace.SDFG("tester")
     state = sdfg.add_state("start", is_start_block=True)
     bnode = tn.StateBoundaryNode(control_flow)
 
-    t2s.create_state_boundary(bnode, state, t2s.StateBoundaryBehavior.STATE_TRANSITION)
+    t2s._create_state_boundary(bnode, state)
     new_label = "cf_state_boundary" if control_flow else "state_boundary"
     assert ["start", new_label] == [state.label for state in sdfg.states()]
 
 
 @pytest.mark.xfail(reason="Not yet implemented")
-@pytest.mark.parametrize("control_flow", (True, False))
-def test_create_state_boundary_empty_memlet(control_flow):
-    sdfg = dace.SDFG("tester")
-    state = sdfg.add_state("start", is_start_block=True)
-    bnode = tn.StateBoundaryNode(control_flow)
-
-    t2s.create_state_boundary(bnode, state, t2s.StateBoundaryBehavior.EMPTY_MEMLET)
+def test_create_state_boundary_empty_memlet():
+    t2s._StreeToSDFG(t2s.StateBoundaryBehavior.EMPTY_MEMLET)
 
 
 def test_create_tasklet_raw():
@@ -843,7 +838,7 @@ def test_assign_nodes_force_state_transition():
         ],
     )
 
-    stree = t2s.insert_state_boundaries_to_tree(stree)
+    stree = t2s._insert_state_boundaries_to_tree(stree)
     assert [type(child) for child in stree.children] == [tn.AssignNode, tn.StateBoundaryNode, tn.TaskletNode]
 
 
@@ -861,7 +856,7 @@ def test_assign_nodes_multiple_force_one_transition():
         ],
     )
 
-    stree = t2s.insert_state_boundaries_to_tree(stree)
+    stree = t2s._insert_state_boundaries_to_tree(stree)
     assert [type(child)
             for child in stree.children] == [tn.AssignNode, tn.AssignNode, tn.StateBoundaryNode, tn.TaskletNode]
 
@@ -880,7 +875,7 @@ def test_assign_nodes_avoid_duplicate_boundaries():
         ],
     )
 
-    stree = t2s.insert_state_boundaries_to_tree(stree)
+    stree = t2s._insert_state_boundaries_to_tree(stree)
     assert [type(child) for child in stree.children] == [tn.AssignNode, tn.StateBoundaryNode, tn.TaskletNode]
 
 
@@ -898,8 +893,7 @@ if __name__ == '__main__':
     test_state_boundaries_propagation(boundary=True)
     test_create_state_boundary_state_transition(control_flow=True)
     test_create_state_boundary_state_transition(control_flow=False)
-    # test_create_state_boundary_empty_memlet(control_flow=True)
-    # test_create_state_boundary_empty_memlet(control_flow=False)
+    # test_create_state_boundary_empty_memlet()
     test_create_tasklet_raw()
     test_create_tasklet_waw()
     test_create_loop_for()
