@@ -11,11 +11,13 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from dace import data, dtypes, symbolic, subsets
 from dace.config import Config
-from dace.data.pydata import PythonList, PythonTuple
+from dace.data.pydata import PythonDict, PythonList, PythonTuple
 from dace.frontend.python.common import DaceSyntaxError
 from dace.frontend.python import astutils, memlet_parser, preprocessing
+from dace.frontend.python.schedule_tree.array_literal_support import ArrayLiteralContext, ArrayLiteralSupportLibrary
+from dace.frontend.python.schedule_tree.dict_support import DictSupportContext, DictSupportLibrary, StaticDictBinding
 from dace.frontend.python.schedule_tree.lambda_support import LambdaResolver
-from dace.frontend.python.schedule_tree.structure_helpers import descriptor_from_structure
+from dace.frontend.python.schedule_tree.structure_support import descriptor_from_structure, resolve_member_access
 from dace.frontend.python.schedule_tree.static_evaluation import UNRESOLVED, try_resolve_static_value
 from dace.frontend.python.schedule_tree.match_support import UnsupportedMatchPatternError, lower_match_to_statements
 from dace.frontend.python.schedule_tree import (AttributeRewriter, ExpressionPlanningContext, CallbackHandler,
@@ -402,6 +404,8 @@ class PythonScheduleTreeBuilder(ast.NodeVisitor):
         self._emit_external_reassign_nodes = isinstance(parsed_ast.preprocessed_ast, ast.Module)
         self._global_lambda_cache: Dict[str, Optional[ast.Lambda]] = {}
         self.expression_support = GenericExpressionSupportLibrary()
+        self.array_literal_support = ArrayLiteralSupportLibrary()
+        self.dict_support = DictSupportLibrary()
         self.numpy_support = NumpySupportLibrary()
         self.attribute_rewriter = AttributeRewriter(self._evaluation_context)
         self.lambda_resolver = LambdaResolver(self.globals,
@@ -518,7 +522,7 @@ class PythonScheduleTreeBuilder(ast.NodeVisitor):
 
     def visit_Return(self, node: ast.Return) -> None:
         if node.value is None:
-            values: List[CodeBlock] = []
+            values: List[str] = []
         else:
             self.callback_handler.reject_mutated_global_uses(node.value)
             return_value = self.lambda_resolver.inline_known_lambda_calls(node.value)
@@ -528,14 +532,14 @@ class PythonScheduleTreeBuilder(ast.NodeVisitor):
                 self._materialize_call_args(return_value)
                 tmp = self._fresh_transient_name('__stree_retval')
                 self._emit_function_call(return_value, return_targets=[tmp])
-                self._append_node(tn.ReturnNode(values=[CodeBlock(tmp)]))
+                self._append_node(tn.ReturnNode(values=[tmp]))
                 return
             if self.callable_resolver.is_sdfg_call(return_value):
                 self._materialize_call_args(return_value)
                 tmp = self._fresh_transient_name('__stree_retval')
                 self._register_binding(tmp, _pyobject_scalar_descriptor(), kind='scalar')
                 if self._emit_sdfg_call(return_value, return_targets=[tmp]):
-                    self._append_node(tn.ReturnNode(values=[CodeBlock(tmp)]))
+                    self._append_node(tn.ReturnNode(values=[tmp]))
                     return
             if isinstance(return_value, ast.Tuple):
                 planned_values = [
@@ -543,57 +547,57 @@ class PythonScheduleTreeBuilder(ast.NodeVisitor):
                                                             value,
                                                             materialize_root=True) for value in return_value.elts
                 ]
-                values = [
-                    CodeBlock(self._format_runtime_expression(self._materialize_return_value(v)))
-                    for v in planned_values
-                ]
+                values = [self._materialize_return_value(v) for v in planned_values]
             else:
                 planned_value = self.expression_support.plan_expression(self._expression_planning_context(),
                                                                         return_value,
                                                                         materialize_root=True)
-                planned_value = self._materialize_return_value(planned_value)
-                values = [CodeBlock(self._format_runtime_expression(planned_value))]
+                values = [self._materialize_return_value(planned_value)]
         self._append_node(tn.ReturnNode(values=values))
 
-    def _materialize_return_value(self, value: ast.AST) -> ast.AST:
-        """Try to lower a return-value expression into a named temporary.
+    def _materialize_return_value(self, value: ast.AST) -> str:
+        """Return the descriptor name backing a return-value expression.
 
-        If the expression is a call whose descriptor can be inferred (e.g.
-        ``numpy.sum(X)``), it is emitted as a proper computation node
-        (LibraryCall / TaskletNode) writing to a fresh transient, and the
-        transient's ``ast.Name`` is returned.  Otherwise *value* is returned
-        unchanged so the caller can still emit it as opaque text.
+        Non-descriptor expressions are materialized into fresh temporaries
+        before returning so :class:`ReturnNode` only refers to descriptor names.
         """
         if _requires_fstring_callback(value):
-            return self.callback_handler.materialize_expression(value,
-                                                                'f-string',
-                                                                _string_scalar_descriptor(),
-                                                                prefix='__stree_retval')
-        if not isinstance(value, ast.Call):
-            descriptor = self._infer_plannable_expression_descriptor(value)
-            should_materialize = False
-            if isinstance(value, ast.Attribute) and self._library_info_for_attribute(value) is not None:
-                should_materialize = True
-            if isinstance(value, ast.Subscript) and self.numpy_support.infer_expression_descriptor(
-                    self._numpy_lowering_context(), value) is not None:
-                should_materialize = True
-            if descriptor is None or isinstance(descriptor, data.Scalar):
-                return value
-            if not should_materialize and self._resolve_data_access(value) is not None:
-                return value
-            return self._materialize_temporary_expression(value, descriptor)
-        descriptor = self._infer_descriptor(value, '__probe')
+            materialized = self.callback_handler.materialize_expression(value,
+                                                                        'f-string',
+                                                                        _string_scalar_descriptor(),
+                                                                        prefix='__stree_retval')
+            return materialized.id
+
+        if isinstance(value, ast.Name) and self._resolve_data_access(value) is not None:
+            return value.id
+
+        descriptor = self._infer_plannable_expression_descriptor(value)
         if descriptor is None:
-            return value
-        name = self._fresh_transient_name('__stree_retval')
-        kind = 'scalar' if isinstance(descriptor, data.Scalar) else 'container'
-        self._register_binding(name, descriptor, kind=kind)
-        target = ast.Name(id=name, ctx=ast.Store())
-        if self._emit_computed_assignment(target, value, descriptor):
-            return ast.Name(id=name, ctx=ast.Load())
-        # Fallback: emit as opaque assignment.
-        self._append_node(tn.AssignNode(name=name, value=CodeBlock(_unparse(value))))
-        return ast.Name(id=name, ctx=ast.Load())
+            descriptor = self._infer_scalar_descriptor(value, None)
+        if descriptor is not None:
+            name = self._fresh_transient_name('__stree_retval')
+            kind = 'scalar' if isinstance(descriptor, data.Scalar) else 'container'
+            self._register_binding(name, descriptor, kind=kind)
+            target = ast.Name(id=name, ctx=ast.Store())
+            if self._emit_computed_assignment(target, value, descriptor):
+                return name
+
+            output = self._resolve_output_target(target, value, descriptor)
+            if output is not None:
+                _, out_memlet, _ = output
+                tasklet = tn.FrontendTasklet(name=self._tasklet_name(target),
+                                             code=CodeBlock(f'{_unparse(target)} = {_unparse(value)}'))
+                self._append_node(
+                    tn.TaskletNode(node=tasklet,
+                                   in_memlets=self._collect_input_memlets(value),
+                                   out_memlets={'out': out_memlet}))
+                return name
+
+        materialized = self.callback_handler.materialize_expression(value,
+                                                                    'return expression',
+                                                                    _pyobject_scalar_descriptor(),
+                                                                    prefix='__stree_retval')
+        return materialized.id
 
     def visit_Pass(self, node: ast.Pass) -> None:
         del node
@@ -986,7 +990,7 @@ class PythonScheduleTreeBuilder(ast.NodeVisitor):
             self.bindings[name] = _clone_binding(binding)
             if binding.descriptor is not None:
                 self.root.containers[name] = _clone_descriptor(binding.descriptor)
-                self.globals[name] = _clone_descriptor(binding.descriptor)
+                self.globals.setdefault(name, _clone_descriptor(binding.descriptor))
 
     def _external_scope_kind(self, name: str) -> Optional[str]:
         if name in self._declared_nonlocal_names:
@@ -1030,6 +1034,7 @@ class PythonScheduleTreeBuilder(ast.NodeVisitor):
         value = self.expression_support.plan_expression(self._expression_planning_context(),
                                                         value,
                                                         materialize_root=False)
+        self._update_dict_subscript_binding(target, value)
 
         source_access = self._resolve_data_access(value)
         if isinstance(target, ast.Name):
@@ -1049,6 +1054,23 @@ class PythonScheduleTreeBuilder(ast.NodeVisitor):
             return
 
         self._append_node(tn.StatementNode(code=CodeBlock(self._format_assignment_statement(target, value))))
+
+    def _update_dict_subscript_binding(self, target: ast.AST, value: ast.AST) -> None:
+        if not isinstance(target, ast.Subscript) or not isinstance(target.value, ast.Name):
+            return
+        binding = self.bindings.get(target.value.id)
+        if binding is None or binding.descriptor is None:
+            return
+        dict_binding = binding.structure if isinstance(binding.structure, StaticDictBinding) else None
+        updated = self.dict_support.infer_assignment_binding(self._dict_support_context(target.value.id),
+                                                             binding.descriptor, dict_binding, target.slice, value)
+        if updated is None:
+            return
+        updated_descriptor, updated_binding = updated
+        self._store_binding(target.value.id,
+                            updated_descriptor,
+                            kind=binding.kind,
+                            structure=updated_binding if updated_binding is not None else None)
 
     def _handle_name_assignment(self, name: str, value: ast.AST, source_access: Optional[Tuple[str, Memlet, data.Data,
                                                                                                Optional[data.Data]]],
@@ -1125,7 +1147,8 @@ class PythonScheduleTreeBuilder(ast.NodeVisitor):
             kind = 'reference' if isinstance(inferred_descriptor, data.Reference) else 'container'
             if self._is_callback_descriptor(inferred_descriptor):
                 kind = 'callback'
-            self._register_binding(name, inferred_descriptor, kind=kind)
+            structure = self._runtime_container_structure(name, value, inferred_descriptor)
+            self._store_binding(name, inferred_descriptor, kind=kind, structure=structure)
         else:
             scalar_descriptor = self._infer_scalar_descriptor(value, annotated_descriptor)
             if scalar_descriptor is not None:
@@ -1142,8 +1165,7 @@ class PythonScheduleTreeBuilder(ast.NodeVisitor):
             self._append_node(tn.AssignNode(name=name, value=CodeBlock(self._format_runtime_expression(value))))
             return
 
-        binding_descriptor = self.bindings.get(name).descriptor if name in self.bindings else None
-        if isinstance(binding_descriptor, (PythonList, PythonTuple)) or isinstance(value, (ast.List, ast.Tuple)):
+        if self._should_emit_runtime_container_assignment(name, value):
             self._append_node(tn.StatementNode(code=CodeBlock(f'{name} = {self._format_runtime_expression(value)}')))
             return
 
@@ -1151,6 +1173,21 @@ class PythonScheduleTreeBuilder(ast.NodeVisitor):
             return
 
         self._append_node(tn.AssignNode(name=name, value=CodeBlock(self._format_runtime_expression(value))))
+
+    def _runtime_container_structure(self, name: str, value: ast.AST, inferred_descriptor: data.Data) -> Optional[Any]:
+        if isinstance(inferred_descriptor, PythonDict) and isinstance(value, ast.Dict):
+            return self.dict_support.infer_literal_binding(self._dict_support_context(name), value)
+        return None
+
+    def _should_emit_runtime_container_assignment(self, name: str, value: ast.AST) -> bool:
+        binding_descriptor = self.bindings.get(name).descriptor if name in self.bindings else None
+        return self._is_runtime_container_descriptor(binding_descriptor) or self._is_runtime_container_literal(value)
+
+    def _is_runtime_container_descriptor(self, descriptor: Optional[data.Data]) -> bool:
+        return isinstance(descriptor, (PythonDict, PythonList, PythonTuple))
+
+    def _is_runtime_container_literal(self, value: ast.AST) -> bool:
+        return isinstance(value, (ast.Dict, ast.List, ast.Tuple))
 
     def _handle_external_name_reassignment(self, name: str, value: ast.AST,
                                            source_access: Optional[Tuple[str, Memlet, data.Data, Optional[data.Data]]],
@@ -1231,6 +1268,12 @@ class PythonScheduleTreeBuilder(ast.NodeVisitor):
         output = self._resolve_output_target(target, value, annotated_descriptor)
         out_memlet = output[1] if output is not None else None
 
+        lowered = self.array_literal_support.lower_assignment(self._array_literal_context(), target, value,
+                                                              annotated_descriptor)
+        if lowered is not None:
+            self._append_node(lowered)
+            return True
+
         lowered = self.numpy_support.lower_assignment(self._numpy_lowering_context(), target, value,
                                                       annotated_descriptor)
         if lowered is not None:
@@ -1306,13 +1349,30 @@ class PythonScheduleTreeBuilder(ast.NodeVisitor):
     def _resolve_data_access(self, node: ast.AST) -> Optional[Tuple[str, Memlet, data.Data, Optional[data.Data]]]:
         if isinstance(node, ast.Name) and node.id in self.bindings and self.bindings[node.id].descriptor is not None:
             descriptor = _clone_descriptor(self.bindings[node.id].descriptor)
+            if isinstance(descriptor, PythonDict):
+                return None
             return (node.id, Memlet.from_array(node.id, descriptor), descriptor, _clone_descriptor(descriptor))
 
-        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
-            base_name = node.value.id
-            if base_name not in self.bindings or self.bindings[base_name].descriptor is None:
+        if isinstance(node, ast.Attribute):
+            owner_access = self._resolve_data_access(node.value)
+            if owner_access is None:
                 return None
-            descriptor = _clone_descriptor(self.bindings[base_name].descriptor)
+            owner_name, _, owner_descriptor, _ = owner_access
+            member_access = resolve_member_access(owner_name, owner_descriptor, node.attr)
+            if member_access is None or isinstance(member_access.descriptor, PythonDict):
+                return None
+            descriptor = member_access.descriptor
+            data_name = member_access.data_name
+            return (data_name, Memlet.from_array(data_name, descriptor), descriptor, _clone_descriptor(descriptor))
+
+        if isinstance(node, ast.Subscript):
+            base_access = self._resolve_data_access(node.value)
+            if base_access is None:
+                return None
+            base_name, _, descriptor, _ = base_access
+            descriptor = _clone_descriptor(descriptor)
+            if isinstance(descriptor, PythonDict):
+                return None
             try:
                 subset, new_axes, arrdims = memlet_parser.parse_memlet_subset(descriptor, node,
                                                                               self._evaluation_context())
@@ -1402,15 +1462,51 @@ class PythonScheduleTreeBuilder(ast.NodeVisitor):
         return result
 
     def _infer_descriptor(self, node: ast.AST, target_name: str) -> Optional[data.Data]:
+        if isinstance(node, ast.Dict):
+            return self.dict_support.infer_literal_descriptor(self._dict_support_context(target_name), node)
+
+        if isinstance(node, ast.Call):
+            inferred = self.array_literal_support.infer_expression_descriptor(self._array_literal_context(), node)
+            if inferred is not None:
+                return inferred
+
         if isinstance(node, (ast.List, ast.Tuple)):
             structure, _ = self._structure_from_ast(node)
             if structure is not None:
                 return descriptor_from_structure(structure)
 
-        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
-            binding = self.bindings.get(node.value.id)
-            if binding is not None and binding.descriptor is not None:
-                inferred = _infer_static_subscript_descriptor(binding.descriptor, node, self._evaluation_context())
+        if isinstance(node, ast.Attribute):
+            access = self._resolve_data_access(node)
+            if access is not None:
+                _, _, descriptor, view_descriptor = access
+                result = _clone_descriptor(view_descriptor or descriptor)
+                result.transient = True
+                return result
+
+        if isinstance(node, ast.Subscript):
+            base_descriptor: Optional[data.Data] = None
+            base_access = self._resolve_data_access(node.value)
+            if base_access is not None:
+                _, _, base_descriptor, _ = base_access
+            elif isinstance(node.value, ast.Name):
+                binding = self.bindings.get(node.value.id)
+                if binding is not None and binding.descriptor is not None:
+                    base_descriptor = binding.descriptor
+            elif isinstance(node.value, ast.Attribute):
+                base_descriptor = self._infer_descriptor(node.value, target_name)
+
+            if base_descriptor is not None:
+                dict_binding = None
+                if isinstance(node.value, ast.Name):
+                    binding = self.bindings.get(node.value.id)
+                    if binding is not None and isinstance(binding.structure, StaticDictBinding):
+                        dict_binding = binding.structure
+                dict_descriptor = self.dict_support.infer_subscript_descriptor(self._dict_support_context(target_name),
+                                                                               base_descriptor, node.slice,
+                                                                               dict_binding)
+                if dict_descriptor is not None:
+                    return dict_descriptor
+                inferred = _infer_static_subscript_descriptor(base_descriptor, node, self._evaluation_context())
                 if inferred is not None:
                     return inferred
 
@@ -1516,9 +1612,17 @@ class PythonScheduleTreeBuilder(ast.NodeVisitor):
         for arg in call_node.args:
             access = self._resolve_data_access(arg)
             if access is not None:
-                name, _, desc, _ = access
-                input_descs[name] = desc
-                args.append(name)
+                name, memlet, desc, view_desc = access
+                is_scalar_memlet = _is_singleton_scalar_memlet(memlet)
+                if is_scalar_memlet:
+                    base_descriptor = view_desc or desc
+                    resolved_desc = data.Scalar(base_descriptor.dtype, transient=True)
+                    key = _unparse(arg)
+                else:
+                    resolved_desc = _clone_descriptor(view_desc or desc)
+                    key = name
+                input_descs[key] = resolved_desc
+                args.append(key)
             else:
                 val = try_resolve_static_value(arg, self._evaluation_context())
                 args.append(val if val is not UNRESOLVED else _unparse(arg))
@@ -1650,11 +1754,24 @@ class PythonScheduleTreeBuilder(ast.NodeVisitor):
             candidate = f'{prefix}{index}'
         return candidate
 
+    def _array_constructor_name(self) -> str:
+        return 'numpy.array'
+
     def _materialize_temporary_expression(self, value: ast.AST, descriptor: data.Data) -> ast.AST:
         name = self._fresh_transient_name()
         kind = 'scalar' if isinstance(descriptor, data.Scalar) else 'container'
         self._register_binding(name, descriptor, kind=kind)
         target = ast.Name(id=name, ctx=ast.Store())
+
+        if isinstance(value, ast.Call) and self.callable_resolver.is_dace_program_call(value):
+            self._materialize_call_args(value)
+            self._emit_function_call(value, return_targets=[name])
+            return ast.Name(id=name, ctx=ast.Load())
+
+        if isinstance(value, ast.Call) and self.callable_resolver.is_sdfg_call(value):
+            self._materialize_call_args(value)
+            if self._emit_sdfg_call(value, return_targets=[name]):
+                return ast.Name(id=name, ctx=ast.Load())
 
         if isinstance(value, ast.Call) and _is_pyobject_scalar_descriptor(descriptor):
             self.callback_handler.emit_assignment(name, value, 'pyobject call', descriptor)
@@ -1963,14 +2080,36 @@ class PythonScheduleTreeBuilder(ast.NodeVisitor):
                                     evaluation_context=self._evaluation_context,
                                     resolve_output_target=self._resolve_output_target,
                                     tasklet_name=self._tasklet_name,
-                                    fresh_symbol=self._fresh_symbol)
+                                    fresh_symbol=self._fresh_symbol,
+                                    fresh_name=self._fresh_transient_name,
+                                    append_node=self._append_node,
+                                    register_binding=self._register_binding)
+
+    def _array_literal_context(self) -> ArrayLiteralContext:
+        return ArrayLiteralContext(infer_descriptor=lambda node: self._infer_descriptor(node, '__probe'),
+                                   infer_scalar_descriptor=self._infer_scalar_descriptor,
+                                   evaluation_context=self._evaluation_context,
+                                   resolve_output_target=self._resolve_output_target,
+                                   resolve_data_access=self._resolve_data_access,
+                                   resolve_callable_name=self._resolved_callable_name,
+                                   tasklet_name=self._tasklet_name,
+                                   array_constructor_name=self._array_constructor_name)
+
+    def _dict_support_context(self, target_name: str = '__probe') -> DictSupportContext:
+        return DictSupportContext(infer_descriptor=lambda node: self._infer_descriptor(node, target_name),
+                                  infer_scalar_descriptor=self._infer_scalar_descriptor,
+                                  evaluation_context=self._evaluation_context)
 
     def _expression_planning_context(self) -> ExpressionPlanningContext:
         return ExpressionPlanningContext(infer_descriptor=self._infer_plannable_expression_descriptor,
                                          materialize_expression=self._materialize_temporary_expression,
                                          resolve_data_access=self._resolve_data_access,
                                          collect_input_memlets=self._collect_input_memlets,
-                                         resolve_output_target=self._resolve_output_target)
+                                         resolve_output_target=self._resolve_output_target,
+                                         resolve_callable_name=self._resolved_callable_name,
+                                         should_materialize_call=lambda node:
+                                         (self.callable_resolver.is_dace_program_call(node) or self.callable_resolver.
+                                          is_sdfg_call(node) or self._should_lower_as_library_call(node)))
 
     def _infer_plannable_expression_descriptor(self, node: ast.AST) -> Optional[data.Data]:
         node = self.lambda_resolver.inline_known_lambda_calls(node)
@@ -1978,6 +2117,12 @@ class PythonScheduleTreeBuilder(ast.NodeVisitor):
                                                                                  node)
         if generic_descriptor is not None:
             return generic_descriptor
+
+        if isinstance(node, ast.Call):
+            array_literal_descriptor = self.array_literal_support.infer_expression_descriptor(
+                self._array_literal_context(), node)
+            if array_literal_descriptor is not None:
+                return array_literal_descriptor
 
         numpy_descriptor = self.numpy_support.infer_expression_descriptor(self._numpy_lowering_context(), node)
         if numpy_descriptor is not None:

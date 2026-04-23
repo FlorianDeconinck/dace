@@ -5,6 +5,8 @@ import numpy as np
 import dace
 from dace.sdfg.analysis.schedule_tree import treenodes as tn
 
+mynp = np
+
 
 def test_python_frontend_schedule_tree_numpy_elementwise_assignment_and_update():
 
@@ -389,7 +391,7 @@ def test_python_frontend_schedule_tree_numpy_explicit_newaxis_return_shape():
     assert isinstance(result_desc, dace.data.Array)
     assert tuple(result_desc.shape) == (20, 1, 1, 30)
     assert isinstance(stree.children[1], tn.ReturnNode)
-    assert stree.children[1].values[0].as_string == '__stree_tmp'
+    assert stree.children[1].values[0] == result_name
 
 
 def test_python_frontend_schedule_tree_numpy_multiple_newaxis_return_shape():
@@ -412,7 +414,7 @@ def test_python_frontend_schedule_tree_numpy_multiple_newaxis_return_shape():
     assert isinstance(result_desc, dace.data.Array)
     assert tuple(result_desc.shape) == (1, 10, 1, 1, 20, 1, 30, 1)
     assert isinstance(stree.children[1], tn.ReturnNode)
-    assert stree.children[1].values[0].as_string == '__stree_tmp'
+    assert stree.children[1].values[0] == result_name
 
 
 def test_python_frontend_schedule_tree_numpy_ellipsis_return_shape():
@@ -435,7 +437,7 @@ def test_python_frontend_schedule_tree_numpy_ellipsis_return_shape():
     assert isinstance(result_desc, dace.data.Array)
     assert tuple(result_desc.shape) == (4, 5, 5, 5)
     assert isinstance(stree.children[1], tn.ReturnNode)
-    assert stree.children[1].values[0].as_string == '__stree_tmp'
+    assert stree.children[1].values[0] == result_name
 
 
 def test_python_frontend_schedule_tree_numpy_advanced_indexing_with_newaxes_return_shape():
@@ -460,7 +462,7 @@ def test_python_frontend_schedule_tree_numpy_advanced_indexing_with_newaxes_retu
     assert isinstance(result_desc, dace.data.Array)
     assert tuple(result_desc.shape) == (3, 3, 3, 1, 5, 6, 6, 2, 1)
     assert isinstance(stree.children[1], tn.ReturnNode)
-    assert stree.children[1].values[0].as_string == '__stree_tmp'
+    assert stree.children[1].values[0] == result_name
 
 
 def test_python_frontend_schedule_tree_numpy_ufunc_map():
@@ -494,7 +496,7 @@ def test_python_frontend_schedule_tree_numpy_batched_matmul_library_call():
     assert isinstance(result_desc, dace.data.Array)
     assert tuple(result_desc.shape) == (3, 34, 31)
     assert isinstance(stree.children[1], tn.ReturnNode)
-    assert stree.children[1].values[0].as_string == '__stree_tmp'
+    assert stree.children[1].values[0] == '__stree_tmp'
 
 
 def test_python_frontend_schedule_tree_numpy_batched_matmul_stationary_left_library_call():
@@ -512,7 +514,7 @@ def test_python_frontend_schedule_tree_numpy_batched_matmul_stationary_left_libr
     assert isinstance(result_desc, dace.data.Array)
     assert tuple(result_desc.shape) == (3, 34, 31)
     assert isinstance(stree.children[1], tn.ReturnNode)
-    assert stree.children[1].values[0].as_string == '__stree_tmp'
+    assert stree.children[1].values[0] == '__stree_tmp'
 
 
 def test_python_frontend_schedule_tree_numpy_bitxor_pseudoscalar_dtype_inference():
@@ -535,7 +537,7 @@ def test_python_frontend_schedule_tree_numpy_bitxor_pseudoscalar_dtype_inference
     assert tuple(result_desc.shape) == (5, 5)
     assert result_desc.dtype == dace.int64
     assert isinstance(stree.children[1], tn.ReturnNode)
-    assert stree.children[1].values[0].as_string == '__stree_tmp'
+    assert stree.children[1].values[0] == '__stree_tmp'
 
 
 def test_python_frontend_schedule_tree_numpy_compare_pseudoscalar_dtype_inference():
@@ -556,7 +558,7 @@ def test_python_frontend_schedule_tree_numpy_compare_pseudoscalar_dtype_inferenc
     assert tuple(result_desc.shape) == (5, 5)
     assert result_desc.dtype == dace.bool_
     assert isinstance(stree.children[1], tn.ReturnNode)
-    assert stree.children[1].values[0].as_string == '__stree_tmp'
+    assert stree.children[1].values[0] == '__stree_tmp'
 
 
 def test_python_frontend_schedule_tree_numpy_transpose_stays_library_call():
@@ -600,6 +602,169 @@ def test_python_frontend_schedule_tree_numpy_attribute_stays_library_call():
     assert stree.children[0].node.properties['receiver_class'] == 'Array'
     assert stree.children[0].node.properties['access_kind'] == 'attribute'
     assert isinstance(stree.children[1], tn.ReturnNode)
+
+
+def test_python_frontend_schedule_tree_numpy_arange_symbolic_library_call():
+
+    K = dace.symbol('K')
+
+    @dace.program
+    def called():
+        return np.arange(K, dtype=np.int32)
+
+    stree = called.to_schedule_tree(K=8)
+
+    assert isinstance(stree.children[0], tn.LibraryCall)
+    assert stree.children[0].node.name == 'numpy.arange'
+    assert stree.children[0].node.properties['start'] == '0'
+    assert stree.children[0].node.properties['stop'] == 'K'
+    result_name = stree.children[0].out_memlets['out'].data
+    result_desc = stree.containers[result_name]
+    assert isinstance(result_desc, dace.data.Array)
+    assert tuple(result_desc.shape) == (K, )
+    assert result_desc.dtype == dace.int32
+    assert isinstance(stree.children[1], tn.ReturnNode)
+
+
+def test_python_frontend_schedule_tree_numpy_arange_scalar_argument_promotes_symbol():
+
+    @dace.program
+    def called(n: dace.int32):
+        return np.arange(n, dtype=np.int32)
+
+    stree = called.to_schedule_tree(np.int32(8))
+
+    assert isinstance(stree.children[0], tn.TaskletNode)
+    assert stree.children[0].node.code.as_string == 'out = n'
+    assert isinstance(stree.children[1], tn.AssignNode)
+    assert stree.children[1].name.startswith('__sym_n')
+    assert isinstance(stree.children[2], tn.LibraryCall)
+    assert stree.children[2].node.name == 'numpy.arange'
+    assert stree.children[2].node.properties['stop'] == stree.children[1].name
+    result_name = stree.children[2].out_memlets['out'].data
+    result_desc = stree.containers[result_name]
+    assert isinstance(result_desc, dace.data.Array)
+    assert str(result_desc.shape[0]).startswith('__sym_n')
+    assert isinstance(stree.children[3], tn.ReturnNode)
+
+
+def test_python_frontend_schedule_tree_numpy_arange_data_scalar_argument_promotes_symbol():
+
+    @dace.program
+    def called(A: dace.int32[1]):
+        return np.arange(A[0], dtype=np.int32)
+
+    stree = called.to_schedule_tree(np.array([8], dtype=np.int32))
+
+    assert isinstance(stree.children[0], tn.TaskletNode)
+    assert stree.children[0].node.code.as_string == 'out = in0'
+    assert str(stree.children[0].in_memlets['in0'].subset) == '0'
+    assert isinstance(stree.children[1], tn.AssignNode)
+    assert stree.children[1].name.startswith('__sym_A_0_')
+    assert isinstance(stree.children[2], tn.LibraryCall)
+    assert stree.children[2].node.properties['stop'] == stree.children[1].name
+    result_name = stree.children[2].out_memlets['out'].data
+    result_desc = stree.containers[result_name]
+    assert isinstance(result_desc, dace.data.Array)
+    assert str(result_desc.shape[0]).startswith('__sym_A_0_')
+    assert isinstance(stree.children[3], tn.ReturnNode)
+
+
+def test_python_frontend_schedule_tree_nested_numpy_attributes_are_materialized():
+
+    @dace.program
+    def called(A: dace.float64[3, 5]):
+        return A.T.T
+
+    stree = called.to_schedule_tree()
+
+    library_calls = [node for node in stree.children if isinstance(node, tn.LibraryCall)]
+    assert len(library_calls) == 2
+    assert all(node.node.name == 'T' for node in library_calls)
+    assert all(node.node.properties['access_kind'] == 'attribute' for node in library_calls)
+    assert isinstance(stree.children[-1], tn.ReturnNode)
+
+
+def test_python_frontend_schedule_tree_nested_numpy_attribute_method_chain_is_materialized():
+
+    @dace.program
+    def called(A: dace.float64[3, 5]):
+        return A.T.T.ravel()
+
+    stree = called.to_schedule_tree()
+
+    library_calls = [node for node in stree.children if isinstance(node, tn.LibraryCall)]
+    assert [node.node.name for node in library_calls] == ['T', 'T', 'ravel']
+    assert library_calls[0].node.properties['access_kind'] == 'attribute'
+    assert library_calls[1].node.properties['access_kind'] == 'attribute'
+    assert library_calls[2].node.properties['access_kind'] == 'method'
+    assert isinstance(stree.children[-1], tn.ReturnNode)
+
+
+def test_python_frontend_schedule_tree_numpy_array_literal_is_materialized_before_elementwise_lowering():
+
+    @dace.program
+    def computed(A: dace.float64[3], out: dace.float64[3]):
+        out[:] = A + np.array([1.0, 2.0, 3.0])
+
+    stree = computed.to_schedule_tree()
+
+    assert isinstance(stree.containers['__stree_tmp'], dace.data.Array)
+    assert tuple(stree.containers['__stree_tmp'].shape) == (3, )
+    assert isinstance(stree.children[0], tn.TaskletNode)
+    assert stree.children[0].node.code.as_string in {
+        'out = np.array([1.0, 2.0, 3.0])',
+        'out = numpy.array([1.0, 2.0, 3.0])',
+    }
+    assert isinstance(stree.children[1], tn.MapScope)
+    tasklet = stree.children[1].children[0]
+    assert isinstance(tasklet, tn.TaskletNode)
+    assert tasklet.node.code.as_string == 'out = (in0 + in1)'
+    assert len(tasklet.in_memlets) == 2
+
+
+def test_python_frontend_schedule_tree_list_literal_in_array_expression_is_materialized_as_array():
+
+    @dace.program
+    def computed(A: dace.float64[3], out: dace.float64[3]):
+        out[:] = A * [1.0, 2.0, 3.0]
+
+    stree = computed.to_schedule_tree()
+
+    assert isinstance(stree.containers['__stree_tmp'], dace.data.Array)
+    assert tuple(stree.containers['__stree_tmp'].shape) == (3, )
+    assert isinstance(stree.children[0], tn.TaskletNode)
+    assert stree.children[0].node.code.as_string in {
+        'out = np.array([1.0, 2.0, 3.0])',
+        'out = numpy.array([1.0, 2.0, 3.0])',
+    }
+    assert isinstance(stree.children[1], tn.MapScope)
+    tasklet = stree.children[1].children[0]
+    assert isinstance(tasklet, tn.TaskletNode)
+    assert tasklet.node.code.as_string == 'out = (in0 * in1)'
+    assert len(tasklet.in_memlets) == 2
+
+
+def test_python_frontend_schedule_tree_aliased_numpy_array_literal_is_materialized_once():
+
+    @dace.program
+    def computed(A: dace.float64[3], out: dace.float64[3]):
+        out[:] = A + mynp.array([1.0, 2.0, 3.0])
+
+    stree = computed.to_schedule_tree()
+
+    assert isinstance(stree.containers['__stree_tmp'], dace.data.Array)
+    assert tuple(stree.containers['__stree_tmp'].shape) == (3, )
+    assert isinstance(stree.children[0], tn.TaskletNode)
+    assert stree.children[0].node.code.as_string in {
+        'out = mynp.array([1.0, 2.0, 3.0])',
+        'out = numpy.array([1.0, 2.0, 3.0])',
+    }
+    assert isinstance(stree.children[1], tn.MapScope)
+    tasklet = stree.children[1].children[0]
+    assert isinstance(tasklet, tn.TaskletNode)
+    assert tasklet.node.code.as_string == 'out = (in0 + in1)'
+    assert len(tasklet.in_memlets) == 2
 
 
 def test_python_frontend_schedule_tree_numpy_compiletime_full_slice_lowers_to_map():
