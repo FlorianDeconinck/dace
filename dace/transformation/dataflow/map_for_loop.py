@@ -53,7 +53,7 @@ class MapToForLoop(transformation.SingleStateTransformation):
         loop_from, loop_to, loop_step = map_entry.map.range[0]
 
         # Turn the map scope into a nested SDFG
-        node = nest_state_subgraph(sdfg, graph, graph.scope_subgraph(map_entry))
+        node = nest_state_subgraph(sdfg, graph, graph.scope_subgraph(map_entry), full_data=True)
 
         nsdfg: SDFG = node.sdfg
         nstate: SDFGState = nsdfg.nodes()[0]
