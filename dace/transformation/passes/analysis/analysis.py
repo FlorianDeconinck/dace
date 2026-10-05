@@ -1,4 +1,4 @@
-# Copyright 2019-2024 ETH Zurich and the DaCe authors. All rights reserved.
+# Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 
 import collections.abc
 from collections import defaultdict, deque
@@ -15,7 +15,6 @@ from dace.sdfg import nodes as nd, utils as sdutil
 from dace.sdfg.analysis import cfg as cfg_analysis
 from dace.sdfg.propagation import align_memlet
 from typing import Dict, Iterable, Iterator, List, Set, Tuple, Any, Optional, Union
-import networkx as nx
 from networkx.algorithms import shortest_paths as nxsp
 from ordered_set import OrderedSet
 
@@ -59,11 +58,8 @@ class StateReachability(ppl.Pass):
         for sdfg in top_sdfg.all_sdfgs_recursive():
             result: Dict[SDFGState, Set[SDFGState]] = defaultdict(OrderedSet)
             for state in sdfg.states():
-                block_reach = cf_block_reach_dict[state.parent_graph.cfg_id][state]
-                if isinstance(block_reach, ReachableBlocks):
-                    result[state] = ReachableBlocks(block_reach.index, state, states_only=True)
-                else:
-                    result[state] = OrderedSet(r for r in block_reach if isinstance(r, SDFGState))
+                block_reach: ReachableBlocks = cf_block_reach_dict[state.parent_graph.cfg_id][state]
+                result[state] = ReachableBlocks(block_reach.index, state, states_only=True)
             reachable[sdfg.cfg_id] = result
         return reachable
 
@@ -705,7 +701,7 @@ class SymbolWriteScopes(ppl.ControlFlowRegionPass):
     def apply(self, region, pipeline_results) -> SymbolScopeDict:
         result: SymbolScopeDict = defaultdict(lambda: defaultdict(lambda: OrderedSet()))
 
-        idom = nx.immediate_dominators(region.nx, region.start_block)
+        idom = sdutil.immediate_dominators(region.nx, region.start_block)
         all_doms = cfg_analysis.all_dominators(region, idom)
 
         b_reach: Dict[ControlFlowBlock, OrderedSet[ControlFlowBlock]] = pipeline_results[
@@ -860,7 +856,7 @@ class ScalarWriteShadowScopes(ppl.Pass):
                     idom_dict[cfg] = {b: b for _, b in cfg.branches}
                     all_doms = {b: OrderedSet([b]) for _, b in cfg.branches}
                 else:
-                    idom_dict[cfg] = nx.immediate_dominators(cfg.nx, cfg.start_block)
+                    idom_dict[cfg] = sdutil.immediate_dominators(cfg.nx, cfg.start_block)
                     all_doms = cfg_analysis.all_dominators(cfg, idom_dict[cfg])
 
                 # Since all_control_flow_regions goes top-down in the graph hierarchy, we can build a transitive
