@@ -146,10 +146,36 @@ def test_translation_units_balanced():
     assert sorted(units.count(u) for u in set(units)) == [2, 3, 3]
 
 
+def test_statement_budget():
+    """ The statement budget limits functions as well as the basic block budget. """
+    sdfg = _chain_of_loops('outline_statement_budget', 6)
+    plans = OutliningPlanner(max_basic_blocks=10**6, max_statements=2).plan(sdfg)
+    assert [len(p.blocks) for p in plans] == [2, 2, 2]
+
+
+def test_translation_units_by_size():
+    """ Small programs use fewer translation units, since each one parses the common preamble. """
+    sdfg = _chain_of_loops('outline_units_by_size', 8)
+    plans = OutliningPlanner(max_basic_blocks=10**6, max_statements=1).plan(sdfg)
+    assign_translation_units(plans, 8, min_unit_statements=3)
+    assert len({p.translation_unit for p in plans}) == 2
+
+
+def test_planner_keeps_opaque_code_in_caller():
+    """ A block calling opaque code (e.g., a callback) stays in its caller, and the functions form around it. """
+    sdfg = _chain_of_loops('outline_opaque', 4)
+    chain = maximal_chains(sdfg)[0]
+    opaque = sdfg.add_state_after(chain[1], 'opaque')
+    opaque.add_tasklet('external', {}, {}, 'external_call()', language=dace.Language.CPP, side_effects=True)
+    plans = OutliningPlanner(max_basic_blocks=10**6, max_statements=10**6).plan_region(sdfg)
+    assert [[b.label for b in p.blocks] for p in plans] == [['loop_0', 'loop_1'], ['loop_2', 'loop_3']]
+
+
 def test_outline_functions_pass():
     sdfg = _chain_of_loops('outline_functions_pass', 6)
     size = CostModel().block(next(b for b in sdfg.nodes() if isinstance(b, LoopRegion))).basic_blocks
-    result = OutlineFunctions(max_basic_blocks=2 * size, min_basic_blocks=0, translation_units=2).apply_pass(sdfg, {})
+    result = OutlineFunctions(max_basic_blocks=2 * size, min_basic_blocks=0, translation_units=2,
+                              min_unit_statements=0).apply_pass(sdfg, {})
     assert result == 3
     regions = [b for b in sdfg.nodes() if isinstance(b, CodeGeneratorFunctionRegion)]
     assert len(regions) == 3
@@ -171,7 +197,8 @@ def test_outline_functions_in_codegen():
     with dace.config.set_temporary('compiler', 'outlining', 'enabled', value=True), \
             dace.config.set_temporary('compiler', 'outlining', 'max_basic_blocks', value=2 * size), \
             dace.config.set_temporary('compiler', 'outlining', 'min_basic_blocks', value=0), \
-            dace.config.set_temporary('compiler', 'outlining', 'translation_units', value=2):
+            dace.config.set_temporary('compiler', 'outlining', 'translation_units', value=2), \
+            dace.config.set_temporary('compiler', 'outlining', 'min_unit_statements', value=0):
         sources = [o for o in sdfg.generate_code() if o.language == 'cpp' and o.linkable]
         assert len(sources) == 3
         A = np.random.rand(10)
@@ -194,6 +221,9 @@ if __name__ == '__main__':
     test_planner_avoids_live_scalar()
     test_planner_divides_large_loop_body()
     test_translation_units_balanced()
+    test_statement_budget()
+    test_translation_units_by_size()
+    test_planner_keeps_opaque_code_in_caller()
     test_outline_functions_pass()
     test_outline_functions_in_codegen()
     test_outline_functions_small_sdfg_unchanged()
