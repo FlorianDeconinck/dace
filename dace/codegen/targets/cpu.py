@@ -41,6 +41,13 @@ def _use_aligned_operator_new(desc: data.Data) -> bool:
         return False
 
 
+def _uses_cpu_memory_pool(desc: data.Data) -> bool:
+    return (isinstance(desc, data.Array) and desc.transient and desc.pool
+            and desc.storage == dtypes.StorageType.CPU_Heap
+            and desc.lifetime not in (dtypes.AllocationLifetime.Global, dtypes.AllocationLifetime.Persistent,
+                                      dtypes.AllocationLifetime.External))
+
+
 @registry.autoregister_params(name='cpu')
 class CPUCodeGen(TargetCodeGenerator):
     """ SDFG CPU code generator. """
@@ -48,6 +55,15 @@ class CPUCodeGen(TargetCodeGenerator):
     title = "CPU"
     target_name = "cpu"
     language = "cpp"
+
+    def _ensure_memory_pool(self):
+        if getattr(self._frame, '_cpu_memory_pool_added', False):
+            return
+
+        self._frame.statestruct.append('dace::MemoryPool *cpu_memory_pool;')
+        self._frame._initcode.write('__state->cpu_memory_pool = new dace::MemoryPool();')
+        self._frame._exitcode.write('delete __state->cpu_memory_pool;')
+        self._frame._cpu_memory_pool_added = True
 
     def _define_sdfg_arguments(self, sdfg, arglist):
         # NOTE: Multi-nesting with container arrays must be further investigated.
@@ -530,11 +546,19 @@ class CPUCodeGen(TargetCodeGenerator):
 
             if not declared:
                 declaration_stream.write(f'{nodedesc.dtype.ctype} *{name};\n', cfg, state_id, node)
-            allocation = f"new {nodedesc.dtype.ctype} [{cpp.sym2cpp(arrsize)}]"
-            if _use_aligned_operator_new(nodedesc):
-                align_value = 64 if nodedesc.alignment == 0 else nodedesc.alignment
-                allocation = f"dace::aligned_new_array<{nodedesc.dtype.ctype}>({cpp.sym2cpp(arrsize)}, {align_value})"
-            allocation_stream.write(f"{alloc_name} = {allocation};\n", cfg, state_id, node)
+            if _uses_cpu_memory_pool(nodedesc):
+                self._ensure_memory_pool()
+                alignment = (str(64 if nodedesc.alignment == 0 else nodedesc.alignment)
+                             if _use_aligned_operator_new(nodedesc) else f'alignof({nodedesc.dtype.ctype})')
+                allocation_stream.write(
+                    f'{alloc_name} = __state->cpu_memory_pool->allocate<{nodedesc.dtype.ctype}>'
+                    f'({cpp.sym2cpp(arrsize)}, {alignment});\n', cfg, state_id, node)
+            else:
+                allocation = f"new {nodedesc.dtype.ctype} [{cpp.sym2cpp(arrsize)}]"
+                if _use_aligned_operator_new(nodedesc):
+                    align_value = 64 if nodedesc.alignment == 0 else nodedesc.alignment
+                    allocation = f"dace::aligned_new_array<{nodedesc.dtype.ctype}>({cpp.sym2cpp(arrsize)}, {align_value})"
+                allocation_stream.write(f"{alloc_name} = {allocation};\n", cfg, state_id, node)
             define_var(name, DefinedType.Pointer, ctypedef)
 
             if node.setzero:
@@ -627,7 +651,11 @@ class CPUCodeGen(TargetCodeGenerator):
               or (nodedesc.storage == dtypes.StorageType.Register and
                   (symbolic.issymbolic(arrsize, sdfg.constants) or
                    (arrsize_bytes and ((arrsize_bytes > Config.get("compiler", "max_stack_array_size")) == True))))):
-            if isinstance(nodedesc, data.Array):
+            if _uses_cpu_memory_pool(nodedesc):
+                self._ensure_memory_pool()
+                callsite_stream.write(f'__state->cpu_memory_pool->release({alloc_name}, {cpp.sym2cpp(arrsize)});\n',
+                                      cfg, state_id, node)
+            elif isinstance(nodedesc, data.Array):
                 if _use_aligned_operator_new(nodedesc):
                     align_value = 64 if nodedesc.alignment == 0 else nodedesc.alignment
                     callsite_stream.write(f"dace::aligned_delete_array({alloc_name}, {align_value});\n", cfg, state_id,
