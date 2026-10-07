@@ -278,7 +278,9 @@ function in the `Matrix Multiplication optimization example <https://github.com/
 
     * **Memory footprint reduction**: Passes such as :class:`~dace.transformation.passes.transient_reuse.TransientReuse`
       can help reduce the amount of bytes allocated by the SDFG. For dynamic memory reuse, use memory pooling by setting
-      the ``pool`` attribute of a data descriptor to ``True``.
+      the ``pool`` attribute of a data descriptor to ``True``. On CPU, this currently pools transient
+      :class:`~dace.dtypes.StorageType.CPU_Heap` arrays; released blocks can be reused across invocations of the same
+      compiled SDFG and are freed when its state is destroyed.
 
     * **Stream and synchronization overhead**: For mostly sequential programs, disabling concurrent GPU streams (see above)
       may help performance. The synchronization between states inside GPU kernels and between thread-block maps can similarly
